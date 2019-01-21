@@ -1,0 +1,919 @@
+#!/usr/bin/perl
+#
+# lusertools (Tools for managing user accounts and groups stored in LDAP)
+#
+# Copyright (c) 2019 Marko Dinic. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+###############################################################################
+    
+our $VERSION = "2.0.0";
+
+###############################################################################
+
+our ($ABSPATH, $PREFIX, $COMMAND, $LIBDIR, $SYSCONFDIR, $LOCALSTATEDIR);
+
+BEGIN {
+
+    use Cwd qw(abs_path);
+    $ABSPATH = abs_path($0);
+    ($PREFIX, $COMMAND) = ($ABSPATH =~ /^(?:(.*)\/)?([^\/]+)$/);
+
+###############################################################################
+# DEFAULT PATHS BEGIN (change if neccessary)
+###############################################################################
+
+
+    $LIBDIR = $PREFIX.'/lib';
+    $SYSCONFDIR = $PREFIX.'/etc';
+    $LOCALSTATEDIR = '/var';
+
+
+###############################################################################
+# DEFAULT PATHS END (don't change anything below this line)
+###############################################################################
+
+}
+
+########################################################################################
+
+use strict;
+use warnings;
+
+########################################################################################
+
+use Getopt::Long qw(:config no_ignore_case);
+
+use Term::ReadKey;
+use MIME::Base64;
+use Crypt::SmbHash;
+
+use Net::LDAP;
+use Net::LDAPS;
+use Net::LDAP::Control::Sort;
+use Net::LDAP::Constant qw(LDAP_SIZELIMIT_EXCEEDED);
+
+########################################################################################
+# DEFAULTS
+########################################################################################
+
+our $config_file = "/etc/lusertools/ldap.conf";
+our $secret_file = "/etc/lusertools/ldap.secret";
+
+########################################################################################
+
+our %config = (
+    'user_objectclasses'	=> [ 
+				    'top',
+				    'account',
+				    'posixAccount',
+				    'shadowAccount',
+				    'sambaAccount',
+				    'sambaSAMAccount',
+				    'qmailUser',
+				    'radiusprofile'
+				   ],
+
+    'group_objectclasses'	=> [ 
+				    'top',
+				    'posixGroup',
+				    'sambaDomain'
+				   ],
+
+    'user_naming_attr'		=> 'uid',
+    'group_naming_attr'		=> 'cn',
+    'uid_attr'			=> 'uidNumber',
+    'gid_attr'			=> 'gidNumber',
+    'rid_attr'			=> 'rid',
+    'samba_sid_attr'		=> 'sambaSID',
+    'homedir_attr'		=> 'homeDirectory',
+    'shell_attr'		=> 'loginShell',
+    'mail_attr'			=> 'mail',
+    'mailhost_attr'		=> 'mailHost',
+    'mailbox_attr'		=> 'mailMessageStore',
+    'mailquota_attr'		=> 'mailQuotaSize',
+    'full_name_attr'		=> 'cn',
+    'gecos_attr'		=> 'gecos',
+    'unix_password_attr'	=> 'userPassword',
+    'ntpassword_attr'		=> 'ntPassword',
+    'samba_ntpassword_attr'	=> 'sambaNTPassword',
+    'lmpassword_attr'		=> 'lmPassword',
+    'samba_lmpassword_attr'	=> 'sambaLMPassword',
+    'roles_attr'		=> 'radiusGroupName',
+    'group_member_attr'		=> 'memberUid',
+
+    'unix_last_change_attr'	=> 'shadowLastChange',
+    'samba_last_change_attr'	=> 'pwdLastSet',
+
+    'minimum_uid'		=> 1000,
+    'minimum_gid'		=> 1000,
+    'default_group'		=> 'users',
+    'default_home'		=> '/home',
+    'default_shell'		=> '/bin/false'
+);
+
+########################################################################################
+
+sub expand_to_bytes($)
+{
+    my $value = shift;
+
+    return undef unless(defined($value) && $value ne '');
+
+    my %mag = ('b' => 0, 'k' => 10, 'm' => 20, 'g' => 30, 't' => 40, 'p' => 50, 'e' => 60);
+
+    ($value, my $unit) = ($value =~ /^\s*(\d+(?:\.\d+)?)\s*([bkmgtpe])?/i);
+
+    if(defined($unit) && $unit ne '') {
+	my $exp = $mag{lc($unit)};
+	$value *= 2**$exp if defined($exp);
+    }
+
+    return int($value);
+}
+
+########################################################################################
+
+sub unix_password($)
+{
+    my $password = shift;
+    my $salt = '';
+    local *U;
+
+    # Generate random salt for crypt()
+    if(open(U, '/dev/urandom')) {
+	# Read random 256 bytes
+	read(U, my $rnd, 256);
+	close(U);
+	# Format salt for SHA256 encryption scheme
+	$salt = '$5$'.encode_base64($rnd);
+    }
+    # Encrypt password with generated salt
+    my $hash = crypt($password, $salt);
+    # Verify generated encrypted password
+    my $check = crypt($password, $hash);
+
+    return ($check eq $hash) ? $hash:undef;
+}
+
+########################################################################################
+
+sub ldap_bind()
+{
+    my $binddn = $config{'bind_dn'};
+    my $bindpw = $config{'bind_pw'};
+
+    my $port = (defined($config{'ldap_port'}) && $config{'ldap_port'}=~ /^\d+$/ &&
+		$config{'ldap_port'} > 0 && $config{'ldap_port'} < 65536) ? $config{'ldap_port'}:undef,
+
+    my $ldap;
+
+    # If SSL is requested ...
+    if($config{'use_ssl'}) {
+	# ... connect to LDAP master over SSL
+	$ldap = Net::LDAPS->new($config{'ldap_server'},
+				'ldap_port' => defined($port) ? $port:636,
+				'verity' => 'none');
+    # ... otherwise ...
+    } else {
+	# ... just connect to LDAP master
+	$ldap = Net::LDAP->new($config{'ldap_server'},
+			       'ldap_port' => defined($port) ? $port:389);
+    }
+
+    return undef unless defined($ldap);
+
+    # Login to LDAP master
+    my $res = $ldap->bind($binddn, 'password' => $bindpw);
+    return undef unless defined($res);
+    if($res->code > 0) {
+	print STDERR $res->error;
+	$ldap->unbind;
+	return undef;
+    }
+
+    return $ldap;
+}
+
+sub ldap_unbind($)
+{
+    $_[0]->unbind;
+}
+
+########################################################################################
+
+sub is_user($$)
+{
+    my ($ldap, $username) = @_;
+
+    my $filter = sprintf('(&(%s=%s)%s)',
+			 $config{'user_naming_attr'},
+			 $username,
+			 $config{'user_objectclass_filter'});
+
+    my $res = $ldap->search('base'      => $config{'users_dn'},
+			    'scope'     => 'one',
+			    'filter'    => $filter,
+			    'attrs'     => [ $config{'user_naming_attr'} ],
+			    'sizelimit' => 1);
+
+    return undef unless defined($res);
+
+    if($res->code > 0) {
+	# We can ignore 'size limit exceeded' error, but not others
+	if($res->code != LDAP_SIZELIMIT_EXCEEDED) {
+	    print STDERR $res->error."\n";
+	    return undef;
+	}
+    }
+
+    return $res->count;
+}
+
+sub is_uid($$)
+{
+    my ($ldap, $uid) = @_;
+
+    my $filter = sprintf('(&(%s=%s)%s)',
+			 $config{'uid_attr'},
+			 $uid,
+			 $config{'user_objectclass_filter'});
+
+    my $res = $ldap->search('base'      => $config{'users_dn'},
+			    'scope'     => 'one',
+			    'filter'    => $filter,
+			    'attrs'     => [ $config{'uid_attr'} ],
+			    'sizelimit' => 1);
+
+    return undef unless defined($res);
+
+    if($res->code > 0) {
+	# We can ignore 'size limit exceeded' error, but not others
+	if($res->code != LDAP_SIZELIMIT_EXCEEDED) {
+	    print STDERR $res->error."\n";
+	    return undef;
+	}
+    }
+
+    return $res->count;
+}
+
+sub get_gid_sid($$)
+{
+    my ($ldap, $group) = @_;
+
+    my $filter = sprintf('(&(%s=%s)%s)',
+			 $config{'group_naming_attr'},
+			 $group,
+			 $config{'group_objectclass_filter'});
+
+    my @attrs = ($config{'gid_attr'});
+
+    if(wantarray && defined($config{'samba_sid_attr'}) && $config{'samba_sid_attr'} ne '') {
+	push @attrs , $config{'samba_sid_attr'};
+    }
+
+    my $res = $ldap->search('base'      => $config{'groups_dn'},
+			    'scope'     => 'one',
+			    'filter'    => $filter,
+			    'attrs'     => \@attrs,
+			    'sizelimit' => 1);
+
+    return undef unless defined($res);
+
+    if($res->code > 0) {
+	# We can ignore 'size limit exceeded' error, but not others
+	if($res->code != LDAP_SIZELIMIT_EXCEEDED) {
+	    print STDERR $res->error."\n";
+	    return undef;
+	}
+    }
+
+    # If group object was found ...
+    if($res->count > 0) {
+	# ... get retrieved result
+	my ($entry) = $res->entries;
+	# ... get GID from the result
+	my $gid = $entry->get_value($config{'gid_attr'});
+	# In scalar context, return GID
+	return $gid unless wantarray;
+	# In list context, return array containing at least GID ...
+	my @gidsid = ($gid);
+	# ... and if samba SID attribute was defined ...
+	if(defined($config{'samba_sid_attr'}) && $config{'samba_sid_attr'} ne '') {
+	    # ... and we got SID as a result ...
+	    my $sid = $entry->get_value($config{'samba_sid_attr'});
+	    push @gidsid, $sid if(defined($sid) && $sid ne '');
+	}
+	# ... return array (GID, SID)
+	return (@gidsid);
+    }
+
+    return undef;
+}
+
+sub get_next_free_uid($)
+{
+    my $ldap = shift;
+    my $next_uid;
+
+    # This is a Server Side Sorting (SSS) control.
+    # We want to do a search with results sorted by
+    # UIDs in reverse/descending order
+    my $sort = Net::LDAP::Control::Sort->new('order' => '-'.$config{'uid_attr'});
+
+    # We will attempt to find free UID several times
+    for(my $try=0; $try < 10; $try++, undef $next_uid) {
+	# Do a server-side-sorted search by UID numbers
+	# and ask only for the first result, which should
+	# be the UID with the highest numeric value.
+	my $res = $ldap->search('base' => $config{'users_dn'},
+				'scope' => 'one',
+				'filter' => $config{'user_objectclass_filter'},
+				'attrs' => [ $config{'uid_attr'} ],
+				'sizelimit' => 1,
+				'control' => [ $sort ]);
+
+	next unless defined($res);
+
+	if($res->code > 0) {
+	    # Error will most likely be 'size limit exceeded',
+	    # but that is to be expected, since the limit is
+	    # 1 and there is probably more than 1 result,
+	    # but as long as it is not some other error, 
+	    # we are fine.
+	    if($res->code != LDAP_SIZELIMIT_EXCEEDED) {
+		print STDERR $res->error."\n";
+		next;
+	    }
+	}
+
+	# If user objects were found ...
+	if($res->count > 0) {
+	    # ... get retrieved result
+	    my ($entry) = $res->entries;
+	    # ... get UID from the result
+	    $next_uid = $entry->get_value($config{'uid_attr'});
+	}
+	
+	# If last used UID exists and conforms to our min UID limit ...
+	if(defined($next_uid) && $next_uid >= $config{'minimum_uid'}) {
+	    # ... skip to the next UID, which should be the free
+	    $next_uid++;
+	# Otherwise ...
+	} else {
+	    # ... we will start from configured min UID
+	    $next_uid = $config{'minimum_uid'};
+	}
+
+	# Make sure UID we produced is not assigned
+	last unless is_uid($ldap, $next_uid);
+    }
+
+    return $next_uid;
+}
+
+sub create_user($$$$$$$$$;$$$$)
+{
+    my ($ldap, $username, $email, $full_name, $uid, $group, $homedir, $shell, $password, $roles, $mailhost, $mailbox, $mailquota) = @_;
+
+    # Username must be defined
+    return 0 unless(defined($username) && $username ne '');
+
+    # Format user objects DN
+    my $userdn = sprintf('%s=%s,%s', $config{'user_naming_attr'}, $username, $config{'users_dn'});
+
+    # Prepare user object's attributes
+    my %attrs = (
+	'objectClass'			=> $config{'user_objectclasses'},
+	$config{'user_naming_attr'}	=> $username
+    );
+
+    my ($gid, $sid);
+
+    # If UID attribute is defined ...
+    if(defined($config{'uid_attr'}) && $config{'uid_attr'} ne '') {
+	# ... and UID wasn't explicitly specified ...
+	unless(defined($uid) && $uid =~ /^\d+$/) {
+	    # ... search for the next free UID 
+	    $uid = get_next_free_uid($ldap);
+	    # UID must be available at this point
+	    unless(defined($uid) && $uid =~ /^\d+$/) {
+		print STDERR "Couldn't find free UID.\n";
+		return 0;
+	    }
+	}
+	# Add UID to user object's attributes
+	$attrs{$config{'uid_attr'}} = $uid;
+    }
+
+    # If GID attribute is defined ...
+    if(defined($config{'gid_attr'}) && $config{'gid_attr'} ne '') {
+	# ... use default group if it's not explicitly given
+	$group = $config{'default_group'} unless(defined($group) && $group ne '');
+	# ... get group's GID and SID
+	($gid, $sid) = get_gid_sid($ldap, $group);
+	# GID must be available at this point
+	unless(defined($gid) && $gid =~ /^\d+$/) {
+	    print STDERR "Unknown group ".$group.".\n";
+	    return 0;
+	}
+	# GID must be greater than or equal to our configured minimum
+	unless($gid >= $config{'minimum_gid'}) {
+	    print STDERR "Group ".$group." is not allowed: GID ".$gid." is below configured minimum (".$config{'minimum_gid'}.").\n";
+	    return 0;
+	}
+	# Add GID to user object's attributes
+	$attrs{$config{'gid_attr'}} = $gid;
+    }
+
+    # If samba RID attribute is defined ...
+    if(defined($config{'rid_attr'}) && $config{'rid_attr'} ne '') {
+	# ... and we have a valid UID ...
+	if(defined($uid) && $uid =~ /^\d+$/) {
+	    # ... use UID as RID and add it to user object's attributes
+	    $attrs{$config{'rid_attr'}} = $uid;
+	}
+    }
+
+    # If samba SID attribute is defined ...
+    if(defined($config{'samba_sid_attr'}) && $config{'samba_sid_attr'} ne '') {
+	# ... and if we have a valid UID ...
+	if(defined($uid) && $uid =~ /^\d+$/) {
+	    # ... group SID must be available at this point
+	    unless(defined($sid) && $sid =~ /^S\-\d+\-\d+\-\d+/) {
+		print STDERR "Group ".$group." doesn't have a valid SID.\n";
+		return 0;
+	    }
+	    # Format user SID and add it to user object's attributes
+	    $attrs{$config{'samba_sid_attr'}} = sprintf('%s-%d-%d-%d', $sid, time(), int(rand(123456789)), $uid);
+	}
+    }
+
+    # If email attribute is defined ...
+    if(defined($config{'mail_attr'}) && $config{'mail_attr'} ne '') {
+	# ... add email to user object's attributes,
+	# using username as email if email wasn't
+	# specified explicitly on the command line
+	$attrs{$config{'mail_attr'}} = (defined($email) && $email =~ /^[^\@]+\@[^\@]+/) ? $email:$username;
+    }
+
+    # If user's full name attribute is defined ...
+    if(defined($config{'full_name_attr'}) && $config{'full_name_attr'} ne '') {
+	# ... add full name to user object's attributes,
+	# using username as full name if full name wasn't
+	# specified explicitly on the command line
+	$attrs{$config{'full_name_attr'}} = (defined($full_name) && $full_name ne '') ? $full_name:$username;
+    }
+
+    # If home dir attribute is defined ...
+    if(defined($config{'homedir_attr'}) && $config{'homedir_attr'} ne '') {
+	# ... add home dir to user object's attributes,
+	# using default home dir if home dir wasnt's
+	# specified explicitly on the command line
+	$attrs{$config{'homedir_attr'}} = (defined($homedir) && $homedir ne '') ? $homedir:$config{'default_home'}.'/'.$username;
+    }
+
+    # If login shell attribute is defined ...
+    if(defined($config{'shell_attr'}) && $config{'shell_attr'} ne '') {
+	# ... add shell to user object's attributes,
+	# using default login shell if shell wasnt's
+	# specified explicitly on the command line
+	$attrs{$config{'shell_attr'}} = (defined($shell) && $shell ne '') ? $shell:$config{'default_shell'};
+    }
+
+    # If gecos attribute is defined ...
+    if(defined($config{'gecos_attr'}) && $config{'gecos_attr'} ne '') {
+	# ... and the full name was given ...
+	if(defined($full_name) && $full_name ne '') {
+	    # ... add gecos to user object's attributes
+	    $attrs{$config{'gecos_attr'}} = $full_name;
+	}
+    }
+
+    # If password was given ...
+    if(defined($password) && $password ne '') {
+	# Generate Unix crypt() password hash
+	my $unix_password = unix_password($password);
+	# Generate Windows NT/LM password hash
+	my ($lm_password, $nt_password) = ntlmgen($password);
+	# If UNIX password attribute is defined ...
+	if(defined($config{'unix_password_attr'}) && $config{'unix_password_attr'} ne '') {
+	    # ... add generated password hash to user object's attributes
+	    $attrs{$config{'unix_password_attr'}} = '{crypt}'.$unix_password;
+	}
+	# If new samba schema's NT password attribute is defined ...
+	if(defined($config{'samba_ntpassword_attr'}) && $config{'samba_ntpassword_attr'} ne '') {
+	    # ... add generated NT hash to user object's attributes
+	    $attrs{$config{'samba_ntpassword_attr'}} = $nt_password;
+	}
+	# If new samba schema's LM password attribute is defined ...
+	if(defined($config{'samba_lmpassword_attr'}) && $config{'samba_lmpassword_attr'} ne '') {
+	    # ... add generated LM hash to user object's attributes
+	    $attrs{$config{'samba_lmpassword_attr'}} = $lm_password;
+	}
+	# If old samba schema's NT password attribute is defined ...
+	if(defined($config{'ntpassword_attr'}) && $config{'ntpassword_attr'} ne '') {
+	    # ... add generated NT hash to user object's attributes
+	    $attrs{$config{'ntpassword_attr'}} = $nt_password;
+	}
+	# If old samba schema's LM password attribute is defined ...
+	if(defined($config{'lmpassword_attr'}) && $config{'lmpassword_attr'} ne '') {
+	    # ... add generated LM hash to user object's attributes
+	    $attrs{$config{'lmpassword_attr'}} = $lm_password;
+	}
+    }
+
+    # If custom roles attribute is defined ...
+    if(defined($config{'roles_attr'}) && $config{'roles_attr'} ne '') {
+	# ... and custom roles were given on the command line ...
+	if(defined($roles) && scalar(@{$roles}) > 0) {
+	    # ... add them to user object's attributes
+	    $attrs{$config{'roles_attr'}} = $roles;
+	}
+    }
+
+    # If mail host attribute is defined ...
+    if(defined($config{'mailhost_attr'}) && $config{'mailhost_attr'} ne '') {
+	# ... and the mail host was given ...
+	if(defined($mailhost) && $mailhost ne '') {
+	    # ... add it to user object's attributes
+	    $attrs{$config{'mailhost_attr'}} = $mailhost;
+	}
+    }
+
+    # If mailbox path attribute is defined ...
+    if(defined($config{'mailbox_attr'}) && $config{'mailbox_attr'} ne '') {
+	# ... and the mailbox path was given ...
+	if(defined($mailbox) && $mailbox ne '') {
+	    # ... add it to user object's attributes
+	    $attrs{$config{'mailbox_attr'}} = $mailbox;
+	}
+    }
+
+    # If mail quota attribute is defined ...
+    if(defined($config{'mailquota_attr'}) && $config{'mailquota_attr'} ne '') {
+	# ... and the mail quota size was given ...
+	my $quota = expand_to_bytes($mailquota);
+	# ... add it to user object's attributes
+	$attrs{$config{'mailquota_attr'}} = $quota if defined($quota);
+    }
+
+    # Current timestamp in days since epoch
+    my $last_change = int(time() / 86400);
+    # If password last change attributes are configured ...
+    foreach my $attrkey ('unix_last_change_attr','samba_last_change_attr') {
+	my $attrname = $config{$attrkey};
+	if(defined($attrname) && $attrname ne '') {
+	    # ... we will be updating them as well
+	    $attrs{$attrname} = $last_change;
+	}
+    }
+
+    # Create user's LDAP object
+    my $res = $ldap->add($userdn, 'attrs' => [ %attrs ]);
+    if($res->code > 0) {
+	print STDERR $res->error."\n";
+	return 0;
+    }
+
+    print "Created user ".$username."\n";
+
+    return 1;
+}
+
+sub assign_user_to_groups($$@)
+{
+    my $ldap = shift;
+    my $username = shift;
+
+    return 0 unless(scalar(@_) > 0 &&
+		    defined($config{'group_member_attr'}) &&
+		    $config{'group_member_attr'} ne '');
+
+    # Add user to every group in the list
+    foreach my $group (@_) {
+
+	# Format group object's DN
+	my $groupdn = sprintf('%s=%s,%s', $config{'group_naming_attr'}, $group, $config{'groups_dn'});
+
+	# Add username as a member to the group LDAP object
+	my $res = $ldap->modify($groupdn, 'add' => { $config{'group_member_attr'} => $username  });
+	if($res->code > 0) {
+	    print STDERR $res->error."\n";
+	    return 0;
+	}
+
+	print "Added user to additional group ".$group."\n";
+
+    }
+
+    return 1;
+}
+
+########################################################################################
+
+sub get_config($$)
+{
+    my ($configfile, $secretfile) = @_;
+    local *CONF;
+
+    # Make sure configuration file exists
+    unless(-f $configfile) {
+	print STDERR "Configuration file is missing.\n";
+	return 0;
+    }
+
+    # Make sure secret file exists
+    unless(-f $secretfile) {
+	print STDERR "Secret file is missing.\n";
+	return 0;
+    }
+
+    # Open config file
+    unless(open(CONF, $configfile)) {
+	print STDERR "Couldn't open configuration file ".$configfile."\n";
+	return 0;
+    }
+
+    # Load configuration
+    while(<CONF>) {
+	chop;
+	$_ =~ s/(#.+)$//g;				 # Strip comments
+	$_ =~ s/^\s+//g;				 # Strip leading spaces
+	$_ =~ s/\s+$//g;				 # Strip trailing spaces
+	my ($opt, $arg) = ($_ =~ /^(\S+)(?:\s+(.*))?$/); # Split config line string
+
+	next unless(defined($opt) && $opt ne '');
+
+	# If configuration option's argument is missing,
+	# that option will be completely ignored, even
+	# if it has a default setting.
+	unless(defined($arg) && $arg ne '') {
+	    delete $config{$opt} if exists $config{$opt};
+	# If configuration option is prefixed with '!',
+	# that option will be completely ignored, even
+	# if it has a default setting.
+	} elsif($opt =~ /^\!(.*)$/) {
+	    delete $config{$1} if($1 ne '' && exists $config{$1});
+	} elsif($opt eq 'use_ssl') {
+	    $config{$opt} = ($arg =~ /^on|yes|true|1$/i) ? 1:0;
+	} elsif($opt =~ /^(?:user|group)\_objectclasses$/) {
+	    $config{$opt} = [ (split(/,/, $arg)) ];
+	} elsif($opt eq 'minimum_uid') {
+	    $config{$opt} = ($arg =~ /^\d+$/ && $arg > 0) ? $arg:1000;
+	} elsif($opt eq 'minimum_gid') {
+	    $config{$opt} = ($arg =~ /^\d+$/ && $arg > 0) ? $arg:1000;
+	} else {
+	    $config{$opt} = $arg;
+	}
+    }
+
+    # Close config file
+    close(CONF);
+
+    # Make sure loaded configuration didn't mess up object classes
+    unless(defined($config{'user_objectclasses'}) && scalar(@{$config{'user_objectclasses'}}) > 0) {
+	print STDERR "At least one user object class must be defined.\n";
+	return 0;
+    }
+    unless(defined($config{'group_objectclasses'}) && scalar(@{$config{'group_objectclasses'}}) > 0) {
+	print STDERR "At least one group object class must be defined.\n";
+	return 0;
+    }
+
+    # Open LDAP bind secret file
+    unless(open(CONF, $secretfile)) {
+	print STDERR "Couldn't open secret file ".$secretfile."\n";
+	return 0;
+    }
+
+    # Get LDAP bind secret
+    my $secret = <CONF>;
+    chomp $secret;
+    # Add LDAP secret to the configuration
+    $config{'bind_pw'} = $secret;
+    # Close LDAP bind secret file
+    close(CONF);
+
+    # Generate object class filters for search operations
+    $config{'user_objectclass_filter'} = '(&(objectClass='.join(')(objectClass=', @{$config{'user_objectclasses'}}).'))';
+    $config{'group_objectclass_filter'} = '(&(objectClass='.join(')(objectClass=', @{$config{'group_objectclasses'}}).'))';
+
+    return 1;
+}
+
+########################################################################################
+
+sub usage()
+{
+print <<EOF 
+Usage: $COMMAND [OPTIONS] <username>
+
+OPTIONS:
+
+ -C, --config <config file>
+ -S, --secret <secret file>
+
+ -e, --email <email address>
+ -c, --gecos <full name>
+ -d, --homedir <home directory>
+ -d, --shell <shell>
+
+ -u, --uid <uid>
+ -g, --group <primary group>
+ -G, --groups <additional group 1>[,<additional group 2>,...]
+ -R, --roles  <custom role 1>[,<custom role 2>,...]
+
+ -p, --password <password>
+
+ -H, --mailhost <server hosting user's mailbox>
+ -B, --mailbox <full path to user's mailbox>
+ -Q, --mailquota <mailbox quota (bytes, short form allowed: k,m,g,t,p,e)>
+
+ -h, --help
+ -v, --version
+
+EOF
+;
+
+    exit(1);
+}
+
+sub version()
+{
+    print "lusertools (version ".$VERSION.")\n\n";
+    usage();
+}
+
+########################################################################################
+#                                       M A I N
+########################################################################################
+
+my ($username, $email, $full_name, $uid, $group, $homedir, $shell);
+my (@additional_groups, @custom_roles);
+my ($new_password, $confirm_password);
+my ($mailhost, $mailbox, $mailquota);
+my ($res, $help, $ver);
+
+# Get command line arguments, if any
+$res = GetOptions('help|h'		=> \$help,
+		  'version|v'		=> \$ver,
+		  'config|C=s'		=> \$config_file,
+		  'secret|S=s'		=> \$secret_file,
+		  'email|e=s'		=> \$email,
+		  'gecos|c=s'		=> \$full_name,
+		  'uid|u=i'		=> \$uid,
+		  'group|g=s'		=> \$group,
+		  'groups|G=s@'		=> \@additional_groups,
+		  'roles|R=s@'		=> \@custom_roles,
+		  'homedir|d=s'		=> \$homedir,
+		  'shell|s=s'		=> \$shell,
+		  'password|p=s'	=> \$new_password,
+		  'mailhost|H=s'	=> \$mailhost,
+		  'mailbox|B=s'		=> \$mailbox,
+		  'mailquota|Q=s'	=> \$mailquota
+);
+
+# Show help if requested
+usage() if(!$res || $help);
+# Show version, if requested
+version() if $ver;
+
+# Username is mandatory, obviously
+if(scalar(@ARGV) == 1) {
+    $username = shift @ARGV;
+# If command line arguments are wrong ...
+} else {
+    # ... show help
+    usage();
+}
+
+# Make sure we were invoked by root
+unless($> == 0 && $< == 0) {
+    print STDERR "Only root can use this command.\n";
+    exit(2);
+}
+
+# Checks and double-checks: username must be defined at this point
+unless(defined($username) && $username ne '') {
+    print STDERR "Username is missing or invalid.\n";
+    exit(3);
+}
+
+# Option -G can be given multiple times,
+# each time with multiple comma-separated
+# groups. This way we normalize it into
+# a simple array of group names
+@additional_groups = split(/,/, (join(',', @additional_groups)));
+# Option -R follows the same logic
+@custom_roles = split(/,/, (join(',', @custom_roles)));
+
+# If password was not given on the command line,
+# enter interactive mode and ask for it
+my $interactive = (defined($new_password) && $new_password ne '') ? 0:1;
+
+# Load config file
+get_config($config_file, $secret_file)
+  or exit(4);
+
+$res = 0;
+
+# Connect and bind to LDAP server
+my $ldap = ldap_bind();
+unless(defined($ldap)) {
+    print STDERR "Failed to connect to LDAP master.\n";
+    exit(5);
+}
+
+# User must not already exist
+if(is_user($ldap, $username)) {
+    print STDERR "User ".$username." already exists.\n";
+    exit(6);
+}
+
+# If explicit UID was specified ...
+if(defined($uid)) {
+    # ... it must be an integer ...
+    unless($uid =~ /^\d+$/) {
+	print STDERR "Invalid UID ".$uid.".\n";
+	exit(7);
+    }
+    # ... must be equal to or greater than configued minimum ...
+    unless($uid >= $config{'minimum_uid'}) {
+	print STDERR "UID ".$uid." is below configured minimum allowed UID.\n";
+	exit(8);
+    }
+    # ... and must not be in use
+    if(is_uid($ldap, $uid)) {
+	print STDERR "UID ".$uid." is already in use.\n";
+	exit(9);
+    }
+}
+
+# If we are in interactive mode, we will be asking user to enter passwords
+if($interactive) {
+    # We will make 3 attempts at most
+    for(my $i=0; $i < 3; $i++) {
+	# Ask for new password
+	print "Enter ".$username."'s new password:";
+	ReadMode('noecho');
+	$new_password = ReadLine(0);
+	ReadMode('restore');
+	chomp $new_password;
+	print "\n";
+
+	last unless(defined($new_password) && $new_password ne '');
+
+	# Ask for new password confirmation
+	print "Retype ".$username."'s new password:";
+	ReadMode('noecho');
+	$confirm_password = ReadLine(0);
+	ReadMode('restore');
+	chomp $confirm_password;
+	print "\n";
+
+	last if(defined($confirm_password) && $confirm_password eq $new_password);
+
+	print "Passwords do not match.\n" ;
+	undef $confirm_password;
+	undef $new_password;
+    }
+}
+
+# Create user account in LDAP
+$res = create_user($ldap,
+		   $username,
+		   $email,
+		   $full_name,
+		   $uid,
+		   $group,
+		   $homedir,
+		   $shell,
+		   $new_password,
+		   \@custom_roles,
+		   $mailhost,
+		   $mailbox,
+		   $mailquota);
+
+# If user creation succeeded, assign it to specified additional groups
+assign_user_to_groups($ldap, $username, @additional_groups) if $res;
+
+# Unbind from server
+ldap_unbind($ldap);
+
+print "User not created.\n" unless $res;
+
+exit($res ? 0:255);

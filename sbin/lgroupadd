@@ -1,0 +1,526 @@
+#!/usr/bin/perl
+#
+# lusertools (Tools for managing user accounts and groups stored in LDAP)
+#
+# Copyright (c) 2019 Marko Dinic. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+###############################################################################
+
+our $VERSION = "2.0.0";
+
+###############################################################################
+
+our ($ABSPATH, $PREFIX, $COMMAND, $LIBDIR, $SYSCONFDIR, $LOCALSTATEDIR);
+
+BEGIN {
+
+    use Cwd qw(abs_path);
+    $ABSPATH = abs_path($0);
+    ($PREFIX, $COMMAND) = ($ABSPATH =~ /^(?:(.*)\/)?([^\/]+)$/);
+
+###############################################################################
+# DEFAULT PATHS BEGIN (change if neccessary)
+###############################################################################
+
+
+    $LIBDIR = $PREFIX.'/lib';
+    $SYSCONFDIR = $PREFIX.'/etc';
+    $LOCALSTATEDIR = '/var';
+
+
+###############################################################################
+# DEFAULT PATHS END (don't change anything below this line)
+###############################################################################
+
+}
+
+########################################################################################
+
+use strict;
+use warnings;
+
+########################################################################################
+
+use Getopt::Long qw(:config no_ignore_case);
+
+use Net::LDAP;
+use Net::LDAPS;
+use Net::LDAP::Control::Sort;
+use Net::LDAP::Constant qw(LDAP_SIZELIMIT_EXCEEDED);
+
+########################################################################################
+# DEFAULTS
+########################################################################################
+
+our $config_file = "/etc/lusertools/ldap.conf";
+our $secret_file = "/etc/lusertools/ldap.secret";
+
+########################################################################################
+
+our %config = (
+    'group_objectclasses'	=> [ 
+				    'top',
+				    'posixGroup',
+				    'sambaDomain'
+				   ],
+
+    'group_naming_attr'		=> 'cn',
+    'samba_domain_attr'		=> 'sambaDomainName',
+    'gid_attr'			=> 'gidNumber',
+    'samba_sid_attr'		=> 'sambaSID',
+    'description_attr'		=> 'description',
+
+    'minimum_gid'		=> 1000,
+    'samba_sid_prefix'		=> 'S-1-5-11'
+);
+
+########################################################################################
+
+sub ldap_bind()
+{
+    my $binddn = $config{'bind_dn'};
+    my $bindpw = $config{'bind_pw'};
+
+    my $port = (defined($config{'ldap_port'}) && $config{'ldap_port'}=~ /^\d+$/ &&
+		$config{'ldap_port'} > 0 && $config{'ldap_port'} < 65536) ? $config{'ldap_port'}:undef,
+
+    my $ldap;
+
+    # If SSL is requested ...
+    if($config{'use_ssl'}) {
+	# ... connect to LDAP master over SSL
+	$ldap = Net::LDAPS->new($config{'ldap_server'},
+				'ldap_port' => defined($port) ? $port:636,
+				'verity' => 'none');
+    # ... otherwise ...
+    } else {
+	# ... just connect to LDAP master
+	$ldap = Net::LDAP->new($config{'ldap_server'},
+			       'ldap_port' => defined($port) ? $port:389);
+    }
+
+    return undef unless defined($ldap);
+
+    # Login to LDAP master
+    my $res = $ldap->bind($binddn, 'password' => $bindpw);
+    return undef unless defined($res);
+    if($res->code > 0) {
+	print STDERR $res->error;
+	$ldap->unbind;
+	return undef;
+    }
+
+    return $ldap;
+}
+
+sub ldap_unbind($)
+{
+    $_[0]->unbind;
+}
+
+########################################################################################
+
+sub is_group($$)
+{
+    my ($ldap, $groupname) = @_;
+
+    my $filter = sprintf('(&(%s=%s)%s)',
+			 $config{'group_naming_attr'},
+			 $groupname,
+			 $config{'group_objectclass_filter'});
+
+    my $res = $ldap->search('base'      => $config{'groups_dn'},
+			    'scope'     => 'one',
+			    'filter'    => $filter,
+			    'attrs'     => [ $config{'group_naming_attr'} ],
+			    'sizelimit' => 1);
+
+    return undef unless defined($res);
+
+    if($res->code > 0) {
+	# We can ignore 'size limit exceeded' error, but not others
+	if($res->code != LDAP_SIZELIMIT_EXCEEDED) {
+	    print STDERR $res->error."\n";
+	    return undef;
+	}
+    }
+
+    return $res->count;
+}
+
+sub is_gid($$)
+{
+    my ($ldap, $gid) = @_;
+
+    my $filter = sprintf('(&(%s=%s)%s)',
+			 $config{'gid_attr'},
+			 $gid,
+			 $config{'group_objectclass_filter'});
+
+    my $res = $ldap->search('base'      => $config{'groups_dn'},
+			    'scope'     => 'one',
+			    'filter'    => $filter,
+			    'attrs'     => [ $config{'gid_attr'} ],
+			    'sizelimit' => 1);
+
+    return undef unless defined($res);
+
+    if($res->code > 0) {
+	# We can ignore 'size limit exceeded' error, but not others
+	if($res->code != LDAP_SIZELIMIT_EXCEEDED) {
+	    print STDERR $res->error."\n";
+	    return undef;
+	}
+    }
+
+    return $res->count;
+}
+
+sub get_next_free_gid($)
+{
+    my $ldap = shift;
+    my $next_gid;
+
+    # This is a Server Side Sorting (SSS) control.
+    # We want to do a search with results sorted by
+    # GIDs in reverse/descending order
+    my $sort = Net::LDAP::Control::Sort->new('order' => '-'.$config{'gid_attr'});
+
+    # We will attempt to find free GID several times
+    for(my $try=0; $try < 10; $try++, undef $next_gid) {
+	# Do a server-side-sorted search by GID numbers
+	# and ask only for the first result, which should
+	# be the GID with the highest numeric value.
+	my $res = $ldap->search('base'      => $config{'groups_dn'},
+				'scope'     => 'one',
+				'filter'    => $config{'group_objectclass_filter'},
+				'attrs'     => [ $config{'gid_attr'} ],
+				'sizelimit' => 1,
+				'control'   => [ $sort ]);
+
+	next unless defined($res);
+
+	if($res->code > 0) {
+	    # Error will most likely be 'size limit exceeded',
+	    # but that is to be expected, since the limit is
+	    # 1 and there is probably more than 1 result,
+	    # but as long as it is not some other error, 
+	    # we are fine.
+	    if($res->code != LDAP_SIZELIMIT_EXCEEDED) {
+		print STDERR $res->error."\n";
+		next;
+	    }
+	}
+
+	# If group objects were found ...
+	if($res->count > 0) {
+	    # ... get retrieved result
+	    my ($entry) = $res->entries;
+	    # ... get GID from the result
+	    $next_gid = $entry->get_value($config{'gid_attr'});
+	}
+
+	# If last used GID exists and conforms to our min GID limit ...
+	if(defined($next_gid) && $next_gid >= $config{'minimum_gid'}) {
+	    # ... skip to the next GID, which
+	    # should be the free GID we seek
+	    $next_gid++;
+	# Otherwise ...
+	} else {
+	    # ... we will start from configured min GID
+	    $next_gid = $config{'minimum_gid'};
+	}
+
+	# Make sure GID we produced is not in use
+	last unless is_gid($ldap, $next_gid);
+    }
+
+    return $next_gid;
+}
+
+sub  create_group($$$$)
+{
+    my ($ldap, $groupname, $gid, $description) = @_;
+
+    # Group name must be defined
+    return 0 unless(defined($groupname) && $groupname ne '');
+
+    # Format group object's DN
+    my $groupdn = sprintf('%s=%s,%s', $config{'group_naming_attr'}, $groupname, $config{'groups_dn'});
+
+    # Prepare group object's attributes
+    my %attrs = (
+	'objectClass'			=> $config{'group_objectclasses'},
+	$config{'group_naming_attr'}	=> $groupname
+    );
+
+    # If GID attribute is defined ...
+    if(defined($config{'gid_attr'}) && $config{'gid_attr'} ne '') {
+	# ... and GID wasn't explicitly specified ...
+	unless(defined($gid) && $gid =~ /^\d+$/) {
+	    # ... search for the next free GID
+	    $gid = get_next_free_gid($ldap);
+	    # GID must be available at this point
+	    unless(defined($gid) && $gid =~ /^\d+$/) {
+		print STDERR "Couldn't find free GID.\n";
+		return 0;
+	    }
+	}
+	# Add GID to group object's attributes
+	$attrs{$config{'gid_attr'}} = $gid;
+    }
+
+    # If samba domain attribute is defined ...
+    if(defined($config{'samba_domain_attr'}) && $config{'samba_domain_attr'} ne '') {
+	# ... add group name as samba domain name to the group object's attributes
+	$attrs{$config{'samba_domain_attr'}} = $groupname;
+    }
+
+    # If samba SID attribute is defined ...
+    if(defined($config{'samba_sid_attr'}) && $config{'samba_sid_attr'} ne '' &&
+       defined($config{'samba_sid_prefix'}) && $config{'samba_sid_prefix'} ne '') {
+	# ... and if we have a valid GID ...
+	if(defined($gid) && $gid =~ /^\d+$/) {
+	    # Format group SID and add it to group object's attributes
+	    $attrs{$config{'samba_sid_attr'}} = sprintf('%s-%d', $config{'samba_sid_prefix'}, $gid),
+	}
+    }
+
+    # If description attribute is defined ...
+    if(defined($config{'description_attr'}) && $config{'description_attr'} ne '') {
+	# ... and group description was given ...
+	if(defined($description) && $description ne '') {
+	    # ... add it to the group object's attributes
+	    $attrs{$config{'description_attr'}} = $description;
+	}
+    }
+
+    # Create group's LDAP object
+    my $res = $ldap->add($groupdn, 'attrs' => [ %attrs ]);
+    if($res->code > 0) {
+	print STDERR $res->error."\n";
+	return 0;
+    }
+
+    print "Created group ".$groupname."\n";
+
+    return 1;
+}
+
+########################################################################################
+
+sub get_config($$)
+{
+    my ($configfile, $secretfile) = @_;
+    local *CONF;
+
+    # Make sure configuration file exists
+    unless(-f $configfile) {
+	print STDERR "Configuration file is missing.\n";
+	return 0;
+    }
+
+    # Make sure secret file exists
+    unless(-f $secretfile) {
+	print STDERR "Secret file is missing.\n";
+	return 0;
+    }
+
+    # Open config file
+    unless(open(CONF, $configfile)) {
+	print STDERR "Couldn't open configuration file ".$configfile."\n";
+	return 0;
+    }
+
+    # Load configuration
+    while(<CONF>) {
+	chop;
+	$_ =~ s/(#.+)$//g;				 # Strip comments
+	$_ =~ s/^\s+//g;				 # Strip leading spaces
+	$_ =~ s/\s+$//g;				 # Strip trailing spaces
+	my ($opt, $arg) = ($_ =~ /^(\S+)(?:\s+(.*))?$/); # Split config line string
+
+	next unless(defined($opt) && $opt ne '');
+
+	# If configuration option's argument is missing,
+	# that option will be completely ignored, even
+	# if it has a default setting.
+	unless(defined($arg) && $arg ne '') {
+	    delete $config{$opt} if exists $config{$opt};
+	# If configuration option is prefixed with '!',
+	# that option will be completely ignored, even
+	# if it has a default setting.
+	} elsif($opt =~ /^\!(.*)$/) {
+	    delete $config{$1} if($1 ne '' && exists $config{$1});
+	} elsif($opt eq 'use_ssl') {
+	    $config{$opt} = ($arg =~ /^on|yes|true|1$/i) ? 1:0;
+	} elsif($opt =~ /^(?:user|group)\_objectclasses$/) {
+	    $config{$opt} = [ (split(/,/, $arg)) ];
+	} elsif($opt eq 'minimum_gid') {
+	    $config{$opt} = ($arg =~ /^\d+$/ && $arg > 0) ? $arg:1000;
+	} else {
+	    $config{$opt} = $arg;
+	}
+    }
+
+    # Close config file
+    close(CONF);
+
+    # Make sure loaded configuration didn't mess up object classes
+    unless(defined($config{'group_objectclasses'}) && scalar(@{$config{'group_objectclasses'}}) > 0) {
+	print STDERR "At least one group object class must be defined.\n";
+	return 0;
+    }
+
+    # Open LDAP bind secret file
+    unless(open(CONF, $secretfile)) {
+	print STDERR "Couldn't open secret file ".$secretfile."\n";
+	return 0;
+    }
+
+    # Get LDAP bind secret
+    my $secret = <CONF>;
+    chomp $secret;
+    # Add LDAP secret to the configuration
+    $config{'bind_pw'} = $secret;
+    # Close LDAP bind secret file
+    close(CONF);
+
+    # Generate object class filter for search operations
+    $config{'group_objectclass_filter'} = '(&(objectClass='.join(')(objectClass=', @{$config{'group_objectclasses'}}).'))';
+
+    return 1;
+}
+
+########################################################################################
+
+sub usage()
+{
+print <<EOF 
+Usage: $COMMAND [OPTIONS] <groupname>
+
+OPTIONS:
+
+ -C, --config <config file>
+ -S, --secret <secret file>
+
+ -g, --gid <gid>
+
+ -d, --description <description>
+
+ -h, --help
+ -v, --version
+
+EOF
+;
+
+    exit(1);
+}
+
+sub version()
+{
+    print "lusertools (version ".$VERSION.")\n\n";
+    usage();
+}
+
+########################################################################################
+#                                       M A I N
+########################################################################################
+
+my ($groupname, $gid, $description);
+my ($res, $help, $ver);
+
+# Get command line arguments, if any
+$res = GetOptions('help|h'		=> \$help,
+		  'version|v'		=> \$ver,
+		  'config|C=s'		=> \$config_file,
+		  'secret|S=s'		=> \$secret_file,
+		  'gid|g=i'		=> \$gid,
+		  'description|d=s'	=> \$description);
+
+# Show help if requested
+usage() if(!$res || $help);
+# Show version, if requested
+version() if $ver;
+
+# Groupname is mandatory, obviously
+if(scalar(@ARGV) == 1) {
+    $groupname = shift @ARGV;
+# If command line arguments are wrong ...
+} else {
+    # ... show help
+    usage();
+}
+
+# Make sure we were invoked by root
+unless($> == 0 && $< == 0) {
+    print STDERR "Only root can use this command.\n";
+    exit(2);
+}
+
+# Checks and double-checks: groupname must be defined at this point
+unless(defined($groupname) && $groupname ne '') {
+    print STDERR "Group name is missing or invalid.\n";
+    exit(3);
+}
+
+# Load config file
+get_config($config_file, $secret_file)
+  or exit(4);
+
+$res = 0;
+
+# Connect and bind to LDAP server
+my $ldap = ldap_bind();
+unless(defined($ldap)) {
+    print STDERR "Failed to connect to LDAP master.\n";
+    exit(5);
+}
+
+# Group must not already exist
+if(is_group($ldap, $groupname)) {
+    print STDERR "Group ".$groupname." already exists.\n";
+    exit(6);
+}
+
+# If explicit GID was specified ...
+if(defined($gid)) {
+    # ... it must be an integer ...
+    unless($gid =~ /^\d+$/) {
+	print STDERR "Invalid GID ".$gid.".\n";
+	exit(7);
+    }
+    # ... must be equal to or greater than configured minimum ...
+    unless($gid >= $config{'minimum_gid'}) {
+	print STDERR "GID ".$gid." is below configured minimum allowed GID.\n";
+	exit(8);
+    }
+    # ... and must not be in use
+    if(is_gid($ldap, $gid)) {
+	print STDERR "GID ".$gid." is already in use.\n";
+	exit(9);
+    }
+}
+
+# Create group object in LDAP
+$res = create_group($ldap, $groupname, $gid, $description);
+
+# Unbind from server
+ldap_unbind($ldap);
+
+print "Group not created.\n" unless $res;
+
+exit($res ? 0:255);
