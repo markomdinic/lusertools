@@ -109,6 +109,100 @@ sub unix_password($)
 
 ########################################################################################
 
+sub is_strong($)
+{
+    my $password = shift;
+
+    return 0 unless defined($password);
+
+    # Get the minimum required number of uppercase characters
+    my $minupper = $config{'password_minimum_uppercase'};
+    $minupper = 0 unless defined($minupper);
+
+    # Get the minimum required number of lowercase characters
+    my $minlower = $config{'password_minimum_lowercase'};
+    $minlower = 0 unless defined($minlower);
+
+    # Get the minimum required number of numeric characters
+    my $minnum = $config{'password_minimum_numeric'};
+    $minnum = 0 unless defined($minnum);
+
+    # Get the minimum required number of non-alphanumeric characters
+    my $minna = $config{'password_minimum_nonalphanum'};
+    $minna = 0 unless defined($minna);
+
+    # Minimum required length cannot be less than the sum
+    # of all configured requirements, if minimum password
+    # length is enforced
+    my $minreq = $minupper + $minlower + $minnum + $minna;
+
+    # Get the minimum required password length
+    my $minlen = $config{'password_minimum_length'};
+    # If minimum password length is defined, minimum password
+    # length requirement will be enforced
+    if(defined($minlen)) {
+	# If configured minimum is less than total length
+	# of other requirements, we will resize it
+	$minlen = $minreq if $minlen < $minreq;
+    # Otherwise ....
+    } else {
+	# ... minimum password length will not be enforced
+	$minlen = 0;
+    }
+
+    # If password minimum length is enforced
+    # and password is shorther than that, fail.
+    if($minlen > 0 && length($password) < $minlen) {
+	print STDERR "Password must be at least ".$minlen." characters long.\n";
+	return 0;
+    }
+
+    # If minimum number of uppercase characters is enforced ...
+    if($minupper > 0) {
+	my $num = () = ($password =~ /[A-Z]/g);
+	# ... and password does not conform, fail
+	unless($num >= $minupper) {
+	    print STDERR "Password must contain at least ".$minupper." uppercase characters.\n";
+	    return 0;
+	}
+    }
+
+    # If minimum number of lowercase characters is enforced ...
+    if($minlower > 0) {
+	my $num = () = ($password =~ /[a-z]/g);
+	# ... and password does not conform, fail
+	unless($num >= $minlower) {
+	    print STDERR "Password must contain at least ".$minlower." lowercase characters.\n";
+	    return 0;
+	}
+    }
+
+    # If minimum number of numeric characters is enforced ...
+    if($minnum > 0) {
+	my $num = () = ($password =~ /[0-9]/g);
+	# ... and password does not conform, fail
+	unless($num >= $minnum) {
+	    print STDERR "Password must contain at least ".$minnum." numeric characters.\n";
+	    return 0;
+	}
+    }
+
+    # If minimum number of non-alphanumeric characters is enforced ...
+    if($minna > 0) {
+	my $num = () = ($password =~ /[^a-zA-Z0-9]/g);
+	# ... and password does not conform, fail
+	unless($num >= $minna) {
+	    print STDERR "Password must contain at least ".$minna." non-alphanumeric characters.\n";
+	    return 0;
+	}
+    }
+
+    # Password conforms to the defined policy
+    return 1;
+}
+
+########################################################################################
+
 sub ldap_bind($$)
 {
     my ($username, $password) = @_;
@@ -421,7 +515,7 @@ get_config($config_file, $secret_file, $current_username)
 # If we are in interactive mode, we will be asking user to enter passwords
 if($interactive) {
     # We will make 3 attempts at most
-    for(my $i=0; $i < 3; $i++) {
+    for(my $i = 0; $i < 3; $i++) {
 	# Ask for current password - it will be used
 	# directly to bind to LDAP server
 	unless($current_username eq 'root') {
@@ -445,17 +539,24 @@ if($interactive) {
 
 	last unless(defined($new_password) && $new_password ne '');
 
-	# Ask for new password confirmation
-	print "Retype ".$whose." new office password:";
-	ReadMode('noecho');
-	$confirm_password = ReadLine(0);
-	ReadMode('restore');
-	chomp $confirm_password;
-	print "\n";
+	# Password must be strong, unless we are root,
+	# in which case we can set whatever we want
+	if(is_strong($new_password) || ($> == 0 && $< == 0 && $current_username eq 'root')) {
 
-	last if(defined($confirm_password) && $confirm_password eq $new_password);
+	    # Ask for new password confirmation
+	    print "Retype ".$whose." new office password:";
+	    ReadMode('noecho');
+	    $confirm_password = ReadLine(0);
+	    ReadMode('restore');
+	    chomp $confirm_password;
+	    print "\n";
 
-	print "Passwords do not match.\n" ;
+	    last if (defined($confirm_password) && $confirm_password eq $new_password);
+
+	    print "Passwords do not match.\n";
+
+	}
+
 	undef $confirm_password;
 	undef $current_password;
 	undef $new_password;
