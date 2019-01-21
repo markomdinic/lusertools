@@ -464,10 +464,16 @@ sub create_user($$$$$$$$$;$$$$)
 
     # If email attribute is defined ...
     if(defined($config{'mail_attr'}) && $config{'mail_attr'} ne '') {
-	# ... add email to user object's attributes,
-	# using username as email if email wasn't
-	# specified explicitly on the command line
-	$attrs{$config{'mail_attr'}} = (defined($email) && $email =~ /^[^\@]+\@[^\@]+/) ? $email:$username;
+	# ... if email address wasn't given ...
+	unless(defined($email) && $email =~ /^[^\@]+\@[^\@]+/) {
+	    # ... use username as email ...
+	    $email = $username;
+	    # ... at default domain, if it is configured
+	    $email .= '@'.$config{'default_domain'} if(defined($config{'default_domain'}) && 
+						       $config{'default_domain'} ne '');
+	}
+	# Add email to user object's attributes,
+        $attrs{$config{'mail_attr'}} = $email;
     }
 
     # If user's full name attribute is defined ...
