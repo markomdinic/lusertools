@@ -112,7 +112,7 @@ sub ldap_bind()
     my $res = $ldap->bind($binddn, 'password' => $bindpw);
     return undef unless defined($res);
     if($res->code > 0) {
-	print STDERR $res->error;
+	print STDERR $res->error."\n";
 	$ldap->unbind;
 	return undef;
     }
@@ -291,12 +291,6 @@ sub get_config($$)
 	return 0;
     }
 
-    # Make sure secret file exists
-    unless(-f $secretfile) {
-	print STDERR "Secret file is missing.\n";
-	return 0;
-    }
-
     # Open config file
     unless(open(CONF, $configfile)) {
 	print STDERR "Couldn't open configuration file ".$configfile."\n";
@@ -333,19 +327,49 @@ sub get_config($$)
     # Close config file
     close(CONF);
 
-    # Open LDAP bind secret file
-    unless(open(CONF, $secretfile)) {
-	print STDERR "Couldn't open secret file ".$secretfile."\n";
+    # If we were invoked by root ...
+    if($> == 0 && $< == 0) {
+	# ... make sure secret file exists
+	unless(-f $secretfile) {
+	    print STDERR "Secret file is missing.\n";
+	    return 0;
+	}
+	# ... open LDAP bind secret file
+	unless(open(CONF, $secretfile)) {
+	    print STDERR "Couldn't open secret file ".$secretfile."\n";
+	    return 0;
+	}
+	# ... get LDAP bind secret
+	my $secret = <CONF>;
+	chomp $secret;
+	# ... close LDAP bind secret file
+	close(CONF);
+	# ... use root DN as bind DN
+	$config{'bind_dn'} = $config{'root_dn'};
+	# ... add LDAP secret to the configuration
+	$config{'bind_pw'} = $secret;
+    }
+
+    unless(defined($config{'ldap_server'}) && $config{'ldap_server'} ne '') {
+	print STDERR "LDAP server not configured properly.\n";
 	return 0;
     }
 
-    # Get LDAP bind secret
-    my $secret = <CONF>;
-    chomp $secret;
-    # Add LDAP secret to the configuration
-    $config{'bind_pw'} = $secret;
-    # Close LDAP bind secret file
-    close(CONF);
+    unless(defined($config{'bind_dn'}) && $config{'bind_dn'} ne '' &&
+	   defined($config{'bind_pw'}) && $config{'bind_pw'} ne '') {
+	print STDERR "Invalid LDAP credentials.\n";
+	return 0;
+    }
+
+    unless(defined($config{'users_dn'}) && $config{'users_dn'} ne '') {
+	print STDERR "Users base DN not configured properly.\n";
+	return 0;
+    }
+
+    unless(defined($config{'groups_dn'}) && $config{'groups_dn'} ne '') {
+	print STDERR "Groups base DN not configured properly.\n";
+	return 0;
+    }
 
     return 1;
 }

@@ -209,9 +209,9 @@ sub ldap_bind($$)
     my ($binddn, $bindpw);
 
     # If current user is root, use admin bind credentials
-    if($username eq 'root') {
+    if($> == 0 && $< == 0) {
 	$binddn = $config{'bind_dn'};
-	$bindpw = $config{'bindpw'};
+	$bindpw = $config{'bind_pw'};
     # If current user is an ordinary user, bind as that user
     } else {
 	$binddn = sprintf('%s=%s,%s', $config{'user_naming_attr'}, $username, $config{'users_dn'});
@@ -242,7 +242,7 @@ sub ldap_bind($$)
     my $res = $ldap->bind($binddn, 'password' => $bindpw);
     return undef unless defined($res);
     if($res->code > 0) {
-	print STDERR $res->error;
+	print STDERR $res->error."\n";
 	$ldap->unbind;
 	return undef;
     }
@@ -370,25 +370,37 @@ sub get_config($$;$)
     # Close config file
     close(CONF);
 
-    # If current user is root ...
-    if($username eq 'root') {
-	# Make sure secret file exists
+   # If we were invoked by root ...
+    if($> == 0 && $< == 0) {
+	# ... make sure secret file exists
 	unless(-f $secretfile) {
 	    print STDERR "Secret file is missing.\n";
 	    return 0;
 	}
-	# Open LDAP bind secret file
+	# ... open LDAP bind secret file
 	unless(open(CONF, $secretfile)) {
 	    print STDERR "Couldn't open secret file ".$secretfile."\n";
 	    return 0;
 	}
-	# Get LDAP bind secret
+	# ... get LDAP bind secret
 	my $secret = <CONF>;
 	chomp $secret;
-	# Add LDAP secret to the configuration
-	$config{'bindpw'} = $secret;
-	# Close LDAP bind secret file
+	# ... finally, close LDAP bind secret file
 	close(CONF);
+	# ... use root DN as bind DN
+	$config{'bind_dn'} = $config{'root_dn'};
+	# ... add LDAP secret to the configuration
+	$config{'bind_pw'} = $secret;
+    }
+
+    unless(defined($config{'ldap_server'}) && $config{'ldap_server'} ne '') {
+	print STDERR "LDAP server not configured properly.\n";
+	return 0;
+    }
+
+    unless(defined($config{'users_dn'}) && $config{'users_dn'} ne '') {
+	print STDERR "Users base DN not configured properly.\n";
+	return 0;
     }
 
     return 1;
