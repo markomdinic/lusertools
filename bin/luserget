@@ -19,7 +19,7 @@
 #
 ###############################################################################
 
-our $VERSION = "2.0.0";
+our $VERSION = "2.1.0";
 
 ###############################################################################
 
@@ -73,6 +73,7 @@ our $secret_file = "/etc/lusertools/ldap.secret";
 our %config = (
     'user_naming_attr'		=> 'uid',
     'group_naming_attr'		=> 'cn',
+    'role_naming_attr'		=> 'cn',
     'uid_attr'			=> 'uidNumber',
     'gid_attr'			=> 'gidNumber',
     'rid_attr'			=> 'rid',
@@ -85,7 +86,8 @@ our %config = (
     'mailquota_attr'		=> 'mailQuotaSize',
     'gecos_attr'		=> 'gecos',
     'roles_attr'		=> 'radiusGroupName',
-    'group_member_attr'		=> 'memberUid'
+    'group_member_attr'		=> 'memberUid',
+    'role_member_attr'		=> 'memberUid'
 );
 
 ########################################################################################
@@ -224,6 +226,40 @@ sub get_additional_groups($$)
     return %groups;
 }
 
+sub get_roles($$)
+{
+    my ($ldap, $username) = @_;
+
+    # Search for roles assigned to this user
+    my $res = $ldap->search('base'   => $config{'roles_dn'},
+			    'scope'  => 'one',
+			    'filter' => sprintf('(%s=%s)', $config{'role_member_attr'}, $username),
+			    'attrs'  => [ $config{'role_naming_attr'}]);
+
+    return () unless defined($res);
+    
+    if($res->code > 0) {
+	# We can ignore 'size limit exceeded' error, but not others
+	if($res->code != LDAP_SIZELIMIT_EXCEEDED) {
+	    print STDERR $res->error."\n";
+	    return ();
+	}
+    }
+
+    my @roles = ();
+
+    # Collect results
+    foreach my $role ($res->entries) {
+	# Get the role's name
+	my $rolename = $role->get_value($config{'role_naming_attr'});
+	next unless(defined($rolename) && $rolename ne '');
+	# Add rolename to the list
+	push @roles, $rolename;
+    }
+
+    return @roles;
+}
+
 sub user_info($$)
 {
     my ($ldap, $username) = @_;
@@ -258,7 +294,6 @@ sub user_info($$)
     my $mailhost = $user->get_value($config{'mailhost_attr'});
     my $mailbox = $user->get_value($config{'mailbox_attr'});
     my $mailquota = $user->get_value($config{'mailquota_attr'});
-    my @custom_roles = $user->get_value($config{'roles_attr'});
 
     # Get user's primary group name by GID
     my $groupname = get_group($ldap, $gid);
@@ -279,15 +314,42 @@ sub user_info($$)
 	push @additional_groups, $gr.' ('.$gid.')';
     }
 
+    my @roles = get_roles($ldap, $username);
+
+    my $group_list = '';
+    my $role_list = '';
+    my $line = '';
+
+    while(defined(my $member = shift(@additional_groups))) {
+	$line .= $member.(scalar(@additional_groups) ? ', ':'');
+	if(40 - length($line) < 5) {
+	    $group_list .= $line.(scalar(@additional_groups) ? "\n".(' 'x21):'');
+	    $line = '';
+	}
+    }
+
+    $group_list .= $line;
+    $line = '';
+
+    while(defined(my $role = shift(@roles))) {
+	$line .= $role.(scalar(@roles) ? ', ':'');
+	if(40 - length($line) < 5) {
+	    $role_list .= $line.(scalar(@roles) ? "\n".(' 'x21):'');
+	    $line = '';
+	}
+    }
+
+    $role_list .= $line;
+
     printf("%-20s %s\n", 'Username:', defined($username) ? $username:'');
     printf("%-20s %s\n", 'Full name:', defined($gecos) ? $gecos:'');
     printf("%-20s %s\n", 'E-mail:', defined($email) ? $email:'');
     printf("%-20s %s\n", 'UID:', defined($uid) ? $uid:'');
     printf("%-20s %s\n", 'Primary group:', defined($groupname) && $groupname ne '' ? $groupname:'');
-    printf("%-20s %s\n", 'Additional groups:', (scalar(@additional_groups) > 0) ? join(', ', @additional_groups):'');
+    printf("%-20s %s\n", 'Additional groups:', $group_list);
+    printf("%-20s %s\n", 'Roles:', $role_list);
     printf("%-20s %s\n", 'Windows RID:', defined($rid) ? $rid:'');
     printf("%-20s %s\n", 'Windows SID:', defined($sid) ? $sid:'');
-    printf("%-20s %s\n", 'Custom roles:', (scalar(@custom_roles) > 0) ? join(', ', @custom_roles):'');
     printf("%-20s %s\n", 'Home directory:', defined($home) ? $home:'');
     printf("%-20s %s\n", 'Shell:', defined($shell) ? $shell:'');
     printf("%-20s %s\n", 'Mail host:', defined($mailhost) ? $mailhost:'');

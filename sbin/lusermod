@@ -19,7 +19,7 @@
 #
 ###############################################################################
 
-our $VERSION = "2.0.0";
+our $VERSION = "2.1.0";
 
 ###############################################################################
 
@@ -92,8 +92,15 @@ our %config = (
 				    'sambaDomain'
 				   ],
 
+    'role_objectclasses'	=> [ 
+				    'top',
+				    'radiusObjectProfile',
+				    'extensibleObject'
+				   ],
+
     'user_naming_attr'		=> 'uid',
     'group_naming_attr'		=> 'cn',
+    'role_naming_attr'		=> 'cn',
     'uid_attr'			=> 'uidNumber',
     'gid_attr'			=> 'gidNumber',
     'rid_attr'			=> 'rid',
@@ -108,6 +115,7 @@ our %config = (
     'gecos_attr'		=> 'gecos',
     'roles_attr'		=> 'radiusGroupName',
     'group_member_attr'		=> 'memberUid',
+    'role_member_attr'		=> 'memberUid',
 
     'minimum_uid'		=> 1000,
     'minimum_gid'		=> 1000
@@ -267,6 +275,86 @@ sub get_gid($$)
 
     # Get GID from the result
     return $entry->get_value($config{'gid_attr'});
+}
+
+sub check_groups($@)
+{
+    my $ldap = shift;
+
+    # Check every group in the list
+    foreach my $group (@_) {
+
+	next if $group eq '';
+
+	# Format search filter
+	my $filter = sprintf('(&(%s=%s)%s)',
+			     $config{'group_naming_attr'},
+			     $group,
+			     $config{'group_objectclass_filter'});
+
+	# Search for group LDAP object
+	my $res = $ldap->search('base'      => $config{'groups_dn'},
+				'scope'     => 'one',
+				'filter'    => $filter,
+				'attrs'     => [ $config{'group_naming_attr'} ],
+				'sizelimit' => 1);
+
+	if($res->code > 0) {
+	    # We can ignore 'size limit exceeded' error, but not others
+	    if($res->code != LDAP_SIZELIMIT_EXCEEDED) {
+		print STDERR $res->error."\n";
+		return undef;
+	    }
+	}
+
+	unless($res->count) {
+	    print "Unknown group ".$group."\n";
+	    return 0;
+	}
+
+    }
+
+    return 1;
+}
+
+sub check_roles($@)
+{
+    my $ldap = shift;
+
+    # Check every role in the list
+    foreach my $role (@_) {
+
+	next if $role eq '';
+
+	# Format search filter
+	my $filter = sprintf('(&(%s=%s)%s)',
+			     $config{'role_naming_attr'},
+			     $role,
+			     $config{'role_objectclass_filter'});
+
+	# Search for role LDAP object
+	my $res = $ldap->search('base'      => $config{'roles_dn'},
+				'scope'     => 'one',
+				'filter'    => $filter,
+				'attrs'     => [ $config{'role_naming_attr'} ],
+				'sizelimit' => 1);
+
+	if($res->code > 0) {
+	    # We can ignore 'size limit exceeded' error, but not others
+	    if($res->code != LDAP_SIZELIMIT_EXCEEDED) {
+		print STDERR $res->error."\n";
+		return undef;
+	    }
+	}
+
+	unless($res->count) {
+	    print "Unknown role ".$role."\n";
+	    return 0;
+	}
+
+    }
+
+    return 1;
 }
 
 sub modify_user($$$$$$$$$;$$$$$)
@@ -457,7 +545,6 @@ sub reassign_user_to_groups($$@)
     return 0 unless(scalar(@_) > 0 &&
 		    defined($config{'group_member_attr'}) &&
 		    $config{'group_member_attr'} ne '');
-
     my %new_groups;
 
     @new_groups{@_} = @_;
@@ -511,17 +598,100 @@ sub reassign_user_to_groups($$@)
     # Add user to every new group in the list
     foreach my $group (keys %new_groups) {
 
+	next if $group eq '';
+
 	# Format group object's DN
 	my $groupdn = sprintf('%s=%s,%s', $config{'group_naming_attr'}, $group, $config{'groups_dn'});
 
 	# Add username as a member to the group LDAP object
-	my $res = $ldap->modify($groupdn, 'add' => { $config{'group_member_attr'} => $username  });
+	my $res = $ldap->modify($groupdn, 'add' => { $config{'group_member_attr'} => $username });
 	if($res->code > 0) {
 	    print STDERR $res->error."\n";
 	    return 0;
 	}
 
 	print "Added user to additional group ".$group."\n";
+
+    }
+
+    return 1;
+}
+
+sub reassign_user_roles($$@)
+{
+    my $ldap = shift;
+    my $username = shift;
+
+    return 0 unless(scalar(@_) > 0 &&
+		    defined($config{'role_member_attr'}) &&
+		    $config{'role_member_attr'} ne '');
+
+    my %new_roles;
+
+    @new_roles{@_} = @_;
+
+    my $filter = sprintf('(%s=%s)', $config{'role_member_attr'}, $username);
+
+    # Search for roles assigned to user
+    my $res = $ldap->search('base'      => $config{'roles_dn'},
+			    'scope'     => 'one',
+			    'filter'    => $filter,
+			    'attrs'     => [ $config{'role_naming_attr'} ]);
+
+    return 0 unless defined($res);
+
+    if($res->code > 0) {
+	print STDERR $res->error."\n";
+	return 0;
+    }
+
+    # Unassign user roles that are not among new roles
+    foreach my $role ($res->entries) {
+
+	# Get role name
+	my $rolename = $role->get_value($config{'role_naming_attr'});
+	next unless(defined($rolename) && $rolename ne '');
+
+	# If user is already assigned one of new roles ...
+	if(defined($new_roles{$rolename})) {
+	    # ... remove that role from the list of new roles ...
+	    delete $new_roles{$rolename};
+	    # ... obviously, do not unassign this role from user
+	    next;
+	}
+
+	# Get role object's DN
+	my $roledn = $role->dn();
+	next unless(defined($roledn) && $roledn ne '');
+
+	# Remove user from the role LDAP object's member attribute
+	my $res = $ldap->modify($roledn, 'delete' => { $config{'role_member_attr'} => $username });
+	next unless defined($res);
+	if($res->code > 0) {
+	    print STDERR $res->error."\n";
+	    return 0;
+	}
+
+	print "Unassigned role ".$rolename."\n";
+
+    }
+
+    # Assign every new role in the list to user
+    foreach my $role (keys %new_roles) {
+
+	next if $role eq '';
+
+	# Format role object's DN
+	my $roledn = sprintf('%s=%s,%s', $config{'role_naming_attr'}, $role, $config{'roles_dn'});
+
+	# Add username as a member to the role LDAP object
+	my $res = $ldap->modify($roledn, 'add' => { $config{'role_member_attr'} => $username });
+	if($res->code > 0) {
+	    print STDERR $res->error."\n";
+	    return 0;
+	}
+
+	print "Assigned role ".$role."\n";
 
     }
 
@@ -569,7 +739,7 @@ sub get_config($$)
 	    delete $config{$1} if($1 ne '' && exists $config{$1});
 	} elsif($opt eq 'use_ssl') {
 	    $config{$opt} = ($arg =~ /^on|yes|true|1$/i) ? 1:0;
-	} elsif($opt =~ /^(?:user|group)\_objectclasses$/) {
+	} elsif($opt =~ /^(?:user|group|role)\_objectclasses$/) {
 	    $config{$opt} = [ (split(/,/, $arg)) ];
 	} elsif($opt eq 'minimum_uid') {
 	    $config{$opt} = ($arg =~ /^\d+$/ && $arg > 0) ? $arg:1000;
@@ -590,6 +760,10 @@ sub get_config($$)
     }
     unless(defined($config{'group_objectclasses'}) && scalar(@{$config{'group_objectclasses'}}) > 0) {
 	print STDERR "At least one group object class must be defined.\n";
+	return 0;
+    }
+    unless(defined($config{'role_objectclasses'}) && scalar(@{$config{'role_objectclasses'}}) > 0) {
+	print STDERR "At least one role object class must be defined.\n";
 	return 0;
     }
 
@@ -637,9 +811,15 @@ sub get_config($$)
 	return 0;
     }
 
+    unless(defined($config{'roles_dn'}) && $config{'roles_dn'} ne '') {
+	print STDERR "Roles base DN not configured properly.\n";
+	return 0;
+    }
+
     # Generate object class filters for search operations
     $config{'user_objectclass_filter'} = '(&(objectClass='.join(')(objectClass=', @{$config{'user_objectclasses'}}).'))';
     $config{'group_objectclass_filter'} = '(&(objectClass='.join(')(objectClass=', @{$config{'group_objectclasses'}}).'))';
+    $config{'role_objectclass_filter'} = '(&(objectClass='.join(')(objectClass=', @{$config{'role_objectclasses'}}).'))';
 
     return 1;
 }
@@ -694,7 +874,7 @@ sub version()
 ########################################################################################
 
 my ($username, $email, $full_name, $uid, $sid, $group, $homedir, $shell);
-my (@additional_groups, @custom_roles);
+my (@additional_groups, @roles);
 my ($mailhost, $mailbox, $mailquota);
 my $newname;
 my ($res, $help, $ver);
@@ -710,7 +890,7 @@ $res = GetOptions('help|h'		=> \$help,
 		  'sid|i=s'		=> \$sid,
 		  'group|g=s'		=> \$group,
 		  'groups|G=s@'		=> \@additional_groups,
-		  'roles|R=s@'		=> \@custom_roles,
+		  'roles|R=s@'		=> \@roles,
 		  'homedir|d=s'		=> \$homedir,
 		  'shell|s=s'		=> \$shell,
 		  'mailhost|H=s'	=> \$mailhost,
@@ -749,9 +929,13 @@ unless(defined($username) && $username ne '') {
 # each time with multiple comma-separated
 # groups. This way we normalize it into
 # a simple array of group names
-@additional_groups = split(/,/, (join(',', @additional_groups)));
+unless(scalar(@additional_groups) == 1 && $additional_groups[0] eq '') {
+    @additional_groups = split(/,/, join(',', @additional_groups));
+}
 # Option -R follows the same logic
-@custom_roles = split(/,/, (join(',', @custom_roles)));
+unless(scalar(@roles) == 1 && $roles[0] eq '') {
+    @roles = split(/,/, join(',', @roles));
+}
 
 # Load config file
 get_config($config_file, $secret_file)
@@ -791,12 +975,24 @@ if(defined($uid)) {
     }
 }
 
+# If explicit primary group was specified, check if it exists
+check_groups($ldap, defined($group) ? $group:())
+    or exit(10);
+
+# Check if specified additional groups exist
+check_groups($ldap, @additional_groups)
+    or exit(11);
+
+# Check if specified roles exist
+check_roles($ldap, @roles)
+    or exit(12);
+
 # If new username is defined ...
 if(defined($newname) && $newname ne '') {
     # ... user with that name must not already exist
     if(is_user($ldap, $newname)) {
 	print STDERR "User ".$newname." already exists.\n";
-	exit(10);
+	exit(13);
     }
 }
 
@@ -810,16 +1006,19 @@ $res = modify_user($ldap,
 		   $group,
 		   $homedir,
 		   $shell,
-		   \@custom_roles,
+		   \@roles,
 		   $mailhost,
 		   $mailbox,
 		   $mailquota,
 		   $newname);
 
-# If modification succeeded and additional groups were given ...
-if($res && scalar(@additional_groups) > 0) {
-    # ... reassign user to specified additional groups
+# If modification succeeded ...
+if($res) {
+    # ... and additional groups were given,
+    # reassign user to specified groups
     reassign_user_to_groups($ldap, $username, @additional_groups);
+    # ... if roles were given reassign them
+    reassign_user_roles($ldap, $username, @roles);
 }
 
 # Unbind from server

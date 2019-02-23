@@ -19,7 +19,7 @@
 #
 ###############################################################################
 
-our $VERSION = "2.0.0";
+our $VERSION = "2.1.0";
 
 ###############################################################################
 
@@ -84,7 +84,9 @@ our %config = (
 
     'user_naming_attr'		=> 'uid',
     'group_naming_attr'		=> 'cn',
+    'role_naming_attr'		=> 'cn',
     'group_member_attr'		=> 'memberUID',
+    'role_member_attr'		=> 'memberUID',
 );
 
 ########################################################################################
@@ -229,6 +231,52 @@ sub remove_user_from_groups($$)
     return 1;
 }
 
+sub unassign_user_roles($$)
+{
+    my $ldap = shift;
+    my $username = shift;
+
+    return 0 unless(defined($config{'role_member_attr'}) &&
+		    $config{'role_member_attr'} ne '');
+
+    my $filter = sprintf('(%s=%s)',
+			 $config{'role_member_attr'},
+			 $username);
+
+    my $res = $ldap->search('base'      => $config{'roles_dn'},
+			    'scope'     => 'one',
+			    'filter'    => $filter,
+			    'attrs'     => [ $config{'role_naming_attr'} ]);
+
+    return 0 unless defined($res);
+
+    if($res->code > 0) {
+	print STDERR $res->error."\n";
+	return 0;
+    }
+    
+    # Unassign every user role in the list
+    foreach my $role ($res->entries) {
+	# Get role name
+	my $rolename = $role->get_value($config{'role_naming_attr'});
+	next unless(defined($rolename) && $rolename ne '');
+	# Get role object's DN
+	my $roledn = $role->dn();
+	next unless(defined($roledn) && $roledn ne '');
+	# Remove username from the role LDAP object's member attribute
+	my $res = $ldap->modify($roledn, 'delete' => { $config{'role_member_attr'} => $username  });
+	next unless defined($res);
+	if($res->code > 0) {
+	    print STDERR $res->error."\n";
+	    return 0;
+	}
+    
+	print "Unassigned role ".$rolename."\n";
+    }
+    
+    return 1;
+}
+
 ########################################################################################
 
 sub get_config($$)
@@ -270,7 +318,7 @@ sub get_config($$)
 	    delete $config{$1} if($1 ne '' && exists $config{$1});
 	} elsif($opt eq 'use_ssl') {
 	    $config{$opt} = ($arg =~ /^on|yes|true|1$/i) ? 1:0;
-	} elsif($opt =~ /^(?:user|group)\_objectclasses$/) {
+	} elsif($opt =~ /^(?:user|group|role)\_objectclasses$/) {
 	    $config{$opt} = [ (split(/,/, $arg)) ];
 	} else {
 	    $config{$opt} = $arg;
@@ -327,6 +375,11 @@ sub get_config($$)
 
     unless(defined($config{'groups_dn'}) && $config{'groups_dn'} ne '') {
 	print STDERR "Groups base DN not configured properly.\n";
+	return 0;
+    }
+
+    unless(defined($config{'roles_dn'}) && $config{'roles_dn'} ne '') {
+	print STDERR "Roles base DN not configured properly.\n";
 	return 0;
     }
 
@@ -432,7 +485,9 @@ unless(is_user($ldap, $username)) {
 }
 
 # Remove user from additional groups, if any
-if(remove_user_from_groups($ldap, $username)) {
+# and unassign user's roles, if any
+if(remove_user_from_groups($ldap, $username) &&
+   unassign_user_roles($ldap, $username)) {
     # Delete user object
     $res = delete_user($ldap, $username);
 }

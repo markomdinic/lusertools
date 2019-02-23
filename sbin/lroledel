@@ -71,13 +71,13 @@ our $secret_file = "/etc/lusertools/ldap.secret";
 ########################################################################################
 
 our %config = (
-    'group_objectclasses'	=> [ 
+    'role_objectclasses'	=> [ 
 				    'top',
-				    'posixGroup',
-				    'sambaDomain'
+				    'radiusObjectProfile',
+				    'extensibleObject'
 				   ],
 
-    'group_naming_attr'		=> 'cn',
+    'role_naming_attr'		=> 'cn',
 );
 
 ########################################################################################
@@ -126,19 +126,19 @@ sub ldap_unbind($)
 
 ########################################################################################
 
-sub is_group($$)
+sub is_role($$)
 {
-    my ($ldap, $groupname) = @_;
+    my ($ldap, $rolename) = @_;
 
     my $filter = sprintf('(&(%s=%s)%s)',
-			 $config{'group_naming_attr'},
-			 $groupname,
-			 $config{'group_objectclass_filter'});
+			 $config{'role_naming_attr'},
+			 $rolename,
+			 $config{'role_objectclass_filter'});
 
-    my $res = $ldap->search('base'      => $config{'groups_dn'},
+    my $res = $ldap->search('base'      => $config{'roles_dn'},
 			    'scope'     => 'one',
 			    'filter'    => $filter,
-			    'attrs'     => [ $config{'group_naming_attr'} ],
+			    'attrs'     => [ $config{'role_naming_attr'} ],
 			    'sizelimit' => 1);
 
     return undef unless defined($res);
@@ -154,24 +154,24 @@ sub is_group($$)
     return $res->count;
 }
 
-sub delete_group($$)
+sub delete_role($$)
 {
-    my ($ldap, $groupname) = @_;
+    my ($ldap, $rolename) = @_;
 
-    # Group name must be defined
-    return 0 unless(defined($groupname) && $groupname ne '');
+    # Role name must be defined
+    return 0 unless(defined($rolename) && $rolename ne '');
 
-    # Format group object's DN
-    my $groupdn = sprintf('%s=%s,%s', $config{'group_naming_attr'}, $groupname, $config{'groups_dn'});
+    # Format role object's DN
+    my $roledn = sprintf('%s=%s,%s', $config{'role_naming_attr'}, $rolename, $config{'roles_dn'});
 
-    # Delete group's LDAP object
-    my $res = $ldap->delete($groupdn);
+    # Delete role's LDAP object
+    my $res = $ldap->delete($roledn);
     if($res->code > 0) {
 	print STDERR $res->error."\n";
 	return 0;
     }
 
-    print "Deleted group ".$groupname."\n";
+    print "Deleted role ".$rolename."\n";
 
     return 1;
 }
@@ -228,8 +228,8 @@ sub get_config($$)
     close(CONF);
 
     # Make sure loaded configuration didn't mess up object classes
-    unless(defined($config{'group_objectclasses'}) && scalar(@{$config{'group_objectclasses'}}) > 0) {
-	print STDERR "At least one group object class must be defined.\n";
+    unless(defined($config{'role_objectclasses'}) && scalar(@{$config{'role_objectclasses'}}) > 0) {
+	print STDERR "At least one role object class must be defined.\n";
 	return 0;
     }
 
@@ -267,13 +267,13 @@ sub get_config($$)
 	return 0;
     }
 
-    unless(defined($config{'groups_dn'}) && $config{'groups_dn'} ne '') {
-	print STDERR "Groups base DN not configured properly.\n";
+    unless(defined($config{'roles_dn'}) && $config{'roles_dn'} ne '') {
+	print STDERR "Roles base DN not configured properly.\n";
 	return 0;
     }
 
     # Generate object class filter for search operations
-    $config{'group_objectclass_filter'} = '(&(objectClass='.join(')(objectClass=', @{$config{'group_objectclasses'}}).'))';
+    $config{'role_objectclass_filter'} = '(&(objectClass='.join(')(objectClass=', @{$config{'role_objectclasses'}}).'))';
     
     return 1;
 }
@@ -283,7 +283,7 @@ sub get_config($$)
 sub usage()
 {
 print <<EOF 
-Usage: $COMMAND [OPTIONS] <groupname>
+Usage: $COMMAND [OPTIONS] <rolename>
 
 OPTIONS:
 
@@ -311,7 +311,7 @@ sub version()
 #                                       M A I N
 ########################################################################################
 
-my ($groupname, $yes);
+my ($rolename, $yes);
 my ($res, $help, $ver);
 
 # Get command line arguments, if any
@@ -326,9 +326,9 @@ usage() if(!$res || $help);
 # Show version, if requested
 version() if $ver;
 
-# Groupname is mandatory, obviously
+# Rolename is mandatory, obviously
 if(scalar(@ARGV) == 1) {
-    $groupname = shift @ARGV;
+    $rolename = shift @ARGV;
 # If command line arguments are wrong ...
 } else {
     # ... show help
@@ -341,16 +341,16 @@ unless($> == 0 && $< == 0) {
     exit(2);
 }
 
-# Checks and double-checks: groupname must be defined at this point
-unless(defined($groupname) && $groupname ne '') {
-    print STDERR "Group name is missing or invalid.\n";
+# Checks and double-checks: rolename must be defined at this point
+unless(defined($rolename) && $rolename ne '') {
+    print STDERR "Role name is missing or invalid.\n";
     exit(3);
 }
 
-# Deleting a group must be confirmed
+# Deleting a role must be confirmed
 # to avoid accidental deletion ...
 unless($yes) {
-    print STDERR "Group deletion must be explicitly confirmed.\n";
+    print STDERR "Role deletion must be explicitly confirmed.\n";
     exit(4);
 }
 
@@ -367,18 +367,18 @@ unless(defined($ldap)) {
     exit(6);
 }
 
-# Group must exist
-unless(is_group($ldap, $groupname)) {
-    print STDERR "Group ".$groupname." doesn't exist.\n";
+# Role must exist
+unless(is_role($ldap, $rolename)) {
+    print STDERR "Role ".$rolename." doesn't exist.\n";
     exit(7);
 }
 
-# Delete group object from LDAP
-$res = delete_group($ldap, $groupname);
+# Delete role object from LDAP
+$res = delete_role($ldap, $rolename);
 
 # Unbind from server
 ldap_unbind($ldap);
 
-print "Group not deleted.\n" unless $res;
+print "Role not deleted.\n" unless $res;
 
 exit($res ? 0:255);

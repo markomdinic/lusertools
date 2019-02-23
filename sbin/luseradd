@@ -19,7 +19,7 @@
 #
 ###############################################################################
     
-our $VERSION = "2.0.0";
+our $VERSION = "2.1.0";
 
 ###############################################################################
 
@@ -92,8 +92,15 @@ our %config = (
 				    'sambaDomain'
 				   ],
 
+    'role_objectclasses'	=> [ 
+				    'top',
+				    'radiusObjectProfile',
+				    'extensibleObject'
+				   ],
+
     'user_naming_attr'		=> 'uid',
     'group_naming_attr'		=> 'cn',
+    'role_naming_attr'		=> 'cn',
     'uid_attr'			=> 'uidNumber',
     'gid_attr'			=> 'gidNumber',
     'rid_attr'			=> 'rid',
@@ -113,6 +120,7 @@ our %config = (
     'samba_lmpassword_attr'	=> 'sambaLMPassword',
     'roles_attr'		=> 'radiusGroupName',
     'group_member_attr'		=> 'memberUid',
+    'role_member_attr'		=> 'memberUid',
 
     'unix_last_change_attr'	=> 'shadowLastChange',
     'samba_last_change_attr'	=> 'pwdLastSet',
@@ -385,6 +393,86 @@ sub get_next_free_uid($)
     return $next_uid;
 }
 
+sub check_groups($@)
+{
+    my $ldap = shift;
+
+    # Check every group in the list
+    foreach my $group (@_) {
+
+	next if $group eq '';
+
+	# Format search filter
+	my $filter = sprintf('(&(%s=%s)%s)',
+			     $config{'group_naming_attr'},
+			     $group,
+			     $config{'group_objectclass_filter'});
+
+	# Search for group LDAP object
+	my $res = $ldap->search('base'      => $config{'groups_dn'},
+				'scope'     => 'one',
+				'filter'    => $filter,
+				'attrs'     => [ $config{'group_naming_attr'} ],
+				'sizelimit' => 1);
+
+	if($res->code > 0) {
+	    # We can ignore 'size limit exceeded' error, but not others
+	    if($res->code != LDAP_SIZELIMIT_EXCEEDED) {
+		print STDERR $res->error."\n";
+		return undef;
+	    }
+	}
+
+	unless($res->count) {
+	    print "Unknown group ".$group."\n";
+	    return 0;
+	}
+
+    }
+
+    return 1;
+}
+
+sub check_roles($@)
+{
+    my $ldap = shift;
+
+    # Check every role in the list
+    foreach my $role (@_) {
+
+	next if $role eq '';
+
+	# Format search filter
+	my $filter = sprintf('(&(%s=%s)%s)',
+			     $config{'role_naming_attr'},
+			     $role,
+			     $config{'role_objectclass_filter'});
+
+	# Search for role LDAP object
+	my $res = $ldap->search('base'      => $config{'roles_dn'},
+				'scope'     => 'one',
+				'filter'    => $filter,
+				'attrs'     => [ $config{'role_naming_attr'} ],
+				'sizelimit' => 1);
+
+	if($res->code > 0) {
+	    # We can ignore 'size limit exceeded' error, but not others
+	    if($res->code != LDAP_SIZELIMIT_EXCEEDED) {
+		print STDERR $res->error."\n";
+		return undef;
+	    }
+	}
+
+	unless($res->count) {
+	    print "Unknown role ".$role."\n";
+	    return 0;
+	}
+
+    }
+
+    return 1;
+}
+
 sub create_user($$$$$$$$$;$$$$)
 {
     my ($ldap, $username, $email, $full_name, $uid, $group, $homedir, $shell, $password, $roles, $mailhost, $mailbox, $mailquota) = @_;
@@ -612,11 +700,13 @@ sub assign_user_to_groups($$@)
     # Add user to every group in the list
     foreach my $group (@_) {
 
+	next if $group eq '';
+
 	# Format group object's DN
 	my $groupdn = sprintf('%s=%s,%s', $config{'group_naming_attr'}, $group, $config{'groups_dn'});
 
 	# Add username as a member to the group LDAP object
-	my $res = $ldap->modify($groupdn, 'add' => { $config{'group_member_attr'} => $username  });
+	my $res = $ldap->modify($groupdn, 'add' => { $config{'group_member_attr'} => $username });
 	if($res->code > 0) {
 	    print STDERR $res->error."\n";
 	    return 0;
@@ -628,6 +718,38 @@ sub assign_user_to_groups($$@)
 
     return 1;
 }
+
+sub assign_user_roles($$@)
+{
+    my $ldap = shift;
+    my $username = shift;
+
+    return 0 unless(scalar(@_) > 0 &&
+		    defined($config{'role_member_attr'}) &&
+		    $config{'role_member_attr'} ne '');
+
+    # Add user to every role in the list
+    foreach my $role (@_) {
+
+	next if $role eq '';
+
+	# Format role object's DN
+	my $roledn = sprintf('%s=%s,%s', $config{'role_naming_attr'}, $role, $config{'roles_dn'});
+
+	# Add username as a member to the role LDAP object
+	my $res = $ldap->modify($roledn, 'add' => { $config{'role_member_attr'} => $username });
+	if($res->code > 0) {
+	    print STDERR $res->error."\n";
+	    return 0;
+	}
+
+	print "Assigned role ".$role."\n";
+
+    }
+
+    return 1;
+}
+
 
 ########################################################################################
 
@@ -670,7 +792,7 @@ sub get_config($$)
 	    delete $config{$1} if($1 ne '' && exists $config{$1});
 	} elsif($opt eq 'use_ssl') {
 	    $config{$opt} = ($arg =~ /^on|yes|true|1$/i) ? 1:0;
-	} elsif($opt =~ /^(?:user|group)\_objectclasses$/) {
+	} elsif($opt =~ /^(?:user|group|role)\_objectclasses$/) {
 	    $config{$opt} = [ (split(/,/, $arg)) ];
 	} elsif($opt eq 'minimum_uid') {
 	    $config{$opt} = ($arg =~ /^\d+$/ && $arg > 0) ? $arg:1000;
@@ -691,6 +813,10 @@ sub get_config($$)
     }
     unless(defined($config{'group_objectclasses'}) && scalar(@{$config{'group_objectclasses'}}) > 0) {
 	print STDERR "At least one group object class must be defined.\n";
+	return 0;
+    }
+    unless(defined($config{'role_objectclasses'}) && scalar(@{$config{'role_objectclasses'}}) > 0) {
+	print STDERR "At least one role object class must be defined.\n";
 	return 0;
     }
 
@@ -738,9 +864,15 @@ sub get_config($$)
 	return 0;
     }
 
+    unless(defined($config{'roles_dn'}) && $config{'roles_dn'} ne '') {
+	print STDERR "Roles base DN not configured properly.\n";
+	return 0;
+    }
+
     # Generate object class filters for search operations
     $config{'user_objectclass_filter'} = '(&(objectClass='.join(')(objectClass=', @{$config{'user_objectclasses'}}).'))';
     $config{'group_objectclass_filter'} = '(&(objectClass='.join(')(objectClass=', @{$config{'group_objectclasses'}}).'))';
+    $config{'role_objectclass_filter'} = '(&(objectClass='.join(')(objectClass=', @{$config{'role_objectclasses'}}).'))';
 
     return 1;
 }
@@ -793,7 +925,7 @@ sub version()
 ########################################################################################
 
 my ($username, $email, $full_name, $uid, $group, $homedir, $shell);
-my (@additional_groups, @custom_roles);
+my (@additional_groups, @roles);
 my ($new_password, $confirm_password);
 my ($mailhost, $mailbox, $mailquota);
 my ($res, $help, $ver);
@@ -808,7 +940,7 @@ $res = GetOptions('help|h'		=> \$help,
 		  'uid|u=i'		=> \$uid,
 		  'group|g=s'		=> \$group,
 		  'groups|G=s@'		=> \@additional_groups,
-		  'roles|R=s@'		=> \@custom_roles,
+		  'roles|R=s@'		=> \@roles,
 		  'homedir|d=s'		=> \$homedir,
 		  'shell|s=s'		=> \$shell,
 		  'password|p=s'	=> \$new_password,
@@ -849,7 +981,7 @@ unless(defined($username) && $username ne '') {
 # a simple array of group names
 @additional_groups = split(/,/, (join(',', @additional_groups)));
 # Option -R follows the same logic
-@custom_roles = split(/,/, (join(',', @custom_roles)));
+@roles = split(/,/, (join(',', @roles)));
 
 # If password was not given on the command line,
 # enter interactive mode and ask for it
@@ -893,6 +1025,18 @@ if(defined($uid)) {
     }
 }
 
+# If explicit primary group was specified, check if it exists
+check_groups($ldap, defined($group) ? $group:())
+    or exit(10);
+
+# Check if specified additional groups exist
+check_groups($ldap, @additional_groups)
+    or exit(11);
+
+# Check if specified roles exist
+check_roles($ldap, @roles)
+    or exit(12);
+
 # If we are in interactive mode, we will be asking user to enter passwords
 if($interactive) {
     # We will make 3 attempts at most
@@ -933,13 +1077,18 @@ $res = create_user($ldap,
 		   $homedir,
 		   $shell,
 		   $new_password,
-		   \@custom_roles,
+		   \@roles,
 		   $mailhost,
 		   $mailbox,
 		   $mailquota);
 
-# If user creation succeeded, assign it to specified additional groups
-assign_user_to_groups($ldap, $username, @additional_groups) if $res;
+# If user creation succeeded ...
+if($res) {
+    # ... assign it to specified additional groups
+    assign_user_to_groups($ldap, $username, @additional_groups);
+    # ... add it to specified role objects
+    assign_user_roles($ldap, $username, @roles);
+}
 
 # Unbind from server
 ldap_unbind($ldap);

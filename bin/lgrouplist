@@ -19,7 +19,7 @@
 #
 ###############################################################################
 
-our $VERSION = "2.0.0";
+our $VERSION = "2.1.0";
 
 ###############################################################################
 
@@ -77,12 +77,56 @@ our %config = (
 				    'sambaDomain'
 				   ],
 
+    'user_naming_attr'		=> 'uid',
     'group_naming_attr'		=> 'cn',
+    'uid_attr'			=> 'uidNumber',
     'gid_attr'			=> 'gidNumber',
     'samba_sid_attr'		=> 'sambaSID',
     'description_attr'		=> 'description',
     'group_member_attr'		=> 'memberUid'
 );
+
+########################################################################################
+
+sub format_table($$$)
+{
+    my ($columns, $spacing, $offset) = @_;
+    my @table = ();
+
+    while(1) {
+	my @row = ();
+	my $i = 0;
+	foreach my $col (@{$columns}) {
+	    my $line = '';
+	    my $data = $col->{'data'};
+	    my $func = $col->{'func'};
+	    while(defined(my $chunk = shift(@{$data}))) {
+		if(defined($func) && ref($func) eq 'CODE') {
+		    $chunk = $func->($chunk);
+		}
+		$line .= $chunk.(scalar(@{$data}) ? $col->{'delim'}:'');
+		last if($col->{'width'} - length($line) < 5);
+	    }
+	    push @row, $line;
+	    $i++ if $line ne '';
+	}
+	last unless $i;
+	push @table, \@row;
+    }
+    
+    my $formatted = '';
+    
+    while(defined(my $row = shift(@table))) {
+	while(defined(my $col = shift @{$row})) {
+	    my $padding = $spacing - length($col);
+	    $padding = 1 if($padding < 1);
+	    $formatted .= $col.(scalar(@{$row}) ? (' 'x$padding):'');
+	}
+	$formatted .= scalar(@table) ? "\n".(' 'x$offset):'';
+    }
+
+    return $formatted;
+}
 
 ########################################################################################
 
@@ -130,6 +174,33 @@ sub ldap_unbind($)
 
 ########################################################################################
 
+sub get_uid($$)
+{
+    my ($ldap, $username) = @_;
+
+    # Search for specific user by username
+    my $res = $ldap->search('base'      => $config{'users_dn'},
+			    'scope'     => 'one',
+			    'filter'    => sprintf('(%s=%s)', $config{'user_naming_attr'}, $username),
+			    'attrs'     => [ $config{'uid_attr'} ],
+			    'sizelimit' => 1);
+
+    return undef unless defined($res);
+
+    if($res->code > 0) {
+	# We can ignore 'size limit exceeded' error, but not others
+	if($res->code != LDAP_SIZELIMIT_EXCEEDED) {
+	    print STDERR $res->error."\n";
+	    return undef;
+	}
+    }
+
+    # Get user's LDAP object
+    my ($user) = $res->entries;
+    # Get UID
+    return $user->get_value($config{'uid_attr'});
+}
+
 sub list_groups($)
 {
     my $ldap = shift;
@@ -156,10 +227,10 @@ sub list_groups($)
     }
 
     # Print header
-    printf("%-16s %-24s %-8s %s\n%s\n",
+    printf("%-16s %-8s %-30s %s\n%s\n",
 	   'Group Name',
-	   'Description',
 	   'GID',
+	   'Description',
 	   'Additional Members',
 	   '-'x100);
 
@@ -171,13 +242,48 @@ sub list_groups($)
 	my $gid = $group->get_value($config{'gid_attr'});
 	my @members = $group->get_value($config{'group_member_attr'});
 
-	printf("%-16s %-24s %-8d %s\n",
+	# Put description and group members into columns
+	# of certain width, which will cause text to be 
+	# broken into multiple lines, if it's length
+	# exceeds column width
+	my $cols = [
+	    # Description
+	    {
+		'data' => [ split(/\s+/, defined($description) ? $description:'') ],
+		'width' => 30,
+		'delim' => ' '
+	    },
+	    # Group members
+	    {
+		'data' => \@members,
+		'width' => 30,
+		'delim' => ', ',
+		'func' => sub {
+		    my $username = shift;
+
+		    my $uid = get_uid($ldap, $username);
+		    if(defined($uid) && $uid ne '') {
+			$username .= ' ('.$uid.')';
+		    }
+
+		    return $username;
+		}
+	    }
+	];
+
+	# Put columns into a table with an offset
+	# of 26 characters from the beginning of
+	# each line and a max of 31 characters of
+	# spacing between columns
+	my $list = format_table($cols, 31 , 26); 
+
+	printf("%-16s %-8d %-24s\n",
 		defined($groupname) ? $groupname:'',
-		defined($description) ? $description:'',
 		defined($gid) ? $gid:'',
-		(scalar(@members) > 0) ? join(',', @members):'');
+		$list);
 
     }
+
 }
 
 ########################################################################################
@@ -221,7 +327,7 @@ sub get_config($$)
 	    delete $config{$1} if($1 ne '' && exists $config{$1});
 	} elsif($opt eq 'use_ssl') {
 	    $config{$opt} = ($arg =~ /^on|yes|true|1$/i) ? 1:0;
-	} elsif($opt =~ /^(?:user|group)\_objectclasses$/) {
+	} elsif($opt =~ /^(?:user|group|role)\_objectclasses$/) {
 	    $config{$opt} = [ (split(/,/, $arg)) ];
 	} elsif($opt eq 'minimum_gid') {
 	    $config{$opt} = ($arg =~ /^\d+$/ && $arg > 0) ? $arg:1000;

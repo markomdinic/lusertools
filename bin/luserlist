@@ -19,7 +19,7 @@
 #
 ###############################################################################
 
-our $VERSION = "2.0.0";
+our $VERSION = "2.1.0";
 
 ###############################################################################
 
@@ -83,21 +83,59 @@ our %config = (
 				    'radiusprofile'
 				   ],
 
-    'group_objectclasses'	=> [ 
-				    'top',
-				    'posixGroup',
-				    'sambaDomain'
-				   ],
-
     'user_naming_attr'		=> 'uid',
     'group_naming_attr'		=> 'cn',
+    'role_naming_attr'		=> 'cn',
     'uid_attr'			=> 'uidNumber',
     'gid_attr'			=> 'gidNumber',
     'gecos_attr'		=> 'gecos',
     'homedir_attr'		=> 'homeDirectory',
     'shell_attr'		=> 'loginShell',
-    'group_member_attr'		=> 'memberUid'
+    'group_member_attr'		=> 'memberUid',
+    'role_member_attr'		=> 'memberUid'
 );
+
+########################################################################################
+
+sub format_table($$$)
+{
+    my ($columns, $spacing, $offset) = @_;
+    my @table = ();
+
+    while(1) {
+	my @row = ();
+	my $i = 0;
+	foreach my $col (@{$columns}) {
+	    my $line = '';
+	    my $data = $col->{'data'};
+	    my $func = $col->{'func'};
+	    while(defined(my $chunk = shift(@{$data}))) {
+		if(defined($func) && ref($func) eq 'CODE') {
+		    $chunk = $func->($chunk);
+		}
+		$line .= $chunk.(scalar(@{$data}) ? $col->{'delim'}:'');
+		last if($col->{'width'} - length($line) < 5);
+	    }
+	    push @row, $line;
+	    $i++ if $line ne '';
+	}
+	last unless $i;
+	push @table, \@row;
+    }
+    
+    my $formatted = '';
+    
+    while(defined(my $row = shift(@table))) {
+	while(defined(my $col = shift @{$row})) {
+	    my $padding = $spacing - length($col);
+	    $padding = 1 if($padding < 1);
+	    $formatted .= $col.(scalar(@{$row}) ? (' 'x$padding):'');
+	}
+	$formatted .= scalar(@table) ? "\n".(' 'x$offset):'';
+    }
+
+    return $formatted;
+}
 
 ########################################################################################
 
@@ -172,6 +210,33 @@ sub get_group($$)
     return $group->get_value($config{'group_naming_attr'});
 }   
 
+sub get_gid($$)
+{
+    my ($ldap, $groupname) = @_;
+
+    my $res = $ldap->search('base'      => $config{'groups_dn'},
+			    'scope'     => 'one',
+			    'filter'    => sprintf('(%s=%s)', $config{'group_naming_attr'}, $groupname),
+			    'attrs'     => [ $config{'gid_attr'} ],
+			    'sizelimit' => 1);
+
+    return undef unless defined($res);
+    
+    if($res->code > 0) {
+	# We can ignore 'size limit exceeded' error, but not others
+	if($res->code != LDAP_SIZELIMIT_EXCEEDED) {
+	    print STDERR $res->error."\n";
+	    return undef;
+	}
+    }
+
+    # Get the group object
+    my ($group) = $res->entries;
+    return undef unless defined($group);
+    # Get GID
+    return $group->get_value($config{'gid_attr'});
+}
+
 sub get_additional_groups($$)
 {
     my ($ldap, $username) = @_;
@@ -198,11 +263,48 @@ sub get_additional_groups($$)
 	# Get group name
 	my $groupname = $group->get_value($config{'group_naming_attr'});
 	next unless(defined($groupname) && $groupname ne '');
+	my $gid = get_gid($ldap, $groupname);
+	if(defined($gid) && $gid ne '') {
+	    $groupname .= ' ('.$gid.')';
+	}
 	# Add it to the list
 	push @groups, $groupname;
     }
 
     return @groups;
+}
+
+sub get_roles($$)
+{
+    my ($ldap, $username) = @_;
+
+    my $res = $ldap->search('base'   => $config{'roles_dn'},
+			    'scope'  => 'one',
+			    'filter' => sprintf('(%s=%s)', $config{'role_member_attr'}, $username),
+			    'attrs'  => [ $config{'role_naming_attr'} ]);
+
+    return () unless defined($res);
+    
+    if($res->code > 0) {
+	# We can ignore 'size limit exceeded' error, but not others
+	if($res->code != LDAP_SIZELIMIT_EXCEEDED) {
+	    print STDERR $res->error."\n";
+	    return ();
+	}
+    }
+
+    my @roles = ();
+
+    # Collect results
+    foreach my $role ($res->entries) {
+	# Get role name
+	my $rolename = $role->get_value($config{'role_naming_attr'});
+	next unless(defined($rolename) && $rolename ne '');
+	# Add it to the list
+	push @roles, $rolename;
+    }
+
+    return @roles;
 }
 
 sub list_users($)
@@ -231,7 +333,7 @@ sub list_users($)
     }
 
     # Print header
-    printf("%-20s %-20s %-8s %-16s %-24s %-10s %s\n%s\n",
+    printf("%-20s %-25s %-8s %-16s %-24s %-12s %-30s %s\n%s\n",
 	   'Username',
 	   'Gecos',
 	   'UID',
@@ -239,7 +341,8 @@ sub list_users($)
 	   'Home Dir',
 	   'Shell',
 	   'Additional Groups',
-	   '-'x120);
+	   'Roles',
+	   '-'x180);
 
     # Print users' metadata
     foreach my $user ($res->entries) {
@@ -252,7 +355,6 @@ sub list_users($)
 
 	# Get user's primary group name by GID
 	my $groupname = get_group($ldap, $gid);
-
 	if(defined($groupname) && $groupname ne '') {
 	    # Append GID to the group name
 	    $groupname .= (defined($gid) && $gid ne '') ? ' ('.$gid.')':'';
@@ -263,14 +365,42 @@ sub list_users($)
 	# Get additional groups this user belongs to
 	my @additional_groups = get_additional_groups($ldap, $username);
 
-	printf("%-20s %-20s %-8d %-16s %-24s %-10s %s\n",
+	# Get roles assigned to this user
+	my @roles = get_roles($ldap, $username);
+
+	# Put additional groups and role members into
+	# columns of certain width, which will cause
+	# text to be broken into multiple lines, if
+	# it's length exceeds column width
+	my $cols = [
+	    # Additional groups
+	    {
+		'data' => \@additional_groups,
+		'width' => 25,
+		'delim' => ', '
+	    },
+	    # Role members
+	    {
+		'data' => \@roles,
+		'width' => 25,
+		'delim' => ', '
+	    }
+	];
+
+	# Put columns into a table with an offset
+	# of 111 characters from the beginning of
+	# each line and a max of 31 characters of
+	# spacing between columns
+	my $list = format_table($cols, 31, 111); 
+
+	printf("%-20s %-25s %-8d %-16s %-24s %-12s %s\n",
 		defined($username) ? $username:'',
-		defined($gecos) ? $gecos:'',
+		defined($gecos) ? substr($gecos, 0, 24):'',
 		defined($uid) ? $uid:'',
 		defined($groupname) && $groupname ne '' ? $groupname:'',
 		defined($home) ? $home:'',
 		defined($shell) ? $shell:'',
-		(scalar(@additional_groups) > 0) ? join(',', @additional_groups):'');
+		$list);
 
     }
 }
@@ -316,7 +446,7 @@ sub get_config($$)
 	    delete $config{$1} if($1 ne '' && exists $config{$1});
 	} elsif($opt eq 'use_ssl') {
 	    $config{$opt} = ($arg =~ /^on|yes|true|1$/i) ? 1:0;
-	} elsif($opt =~ /^(?:user|group)\_objectclasses$/) {
+	} elsif($opt =~ /^(?:user|group|role)\_objectclasses$/) {
 	    $config{$opt} = [ (split(/,/, $arg)) ];
 	} else {
 	    $config{$opt} = $arg;

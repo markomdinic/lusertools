@@ -19,7 +19,7 @@
 #
 ###############################################################################
 
-our $VERSION = "2.0.0";
+our $VERSION = "2.1.0";
 
 ###############################################################################
 
@@ -243,11 +243,36 @@ sub group_info($$)
 	push @additional_members, $member;
     }
 
+    my $primary_list = '';
+    my $additional_list = '';
+    my $line = '';
+
+    while(defined(my $member = shift(@primary_members))) {
+	$line .= $member.(scalar(@primary_members) ? ', ':'');
+	if(40 - length($line) < 5) {
+	    $primary_list .= $line.(scalar(@primary_members) ? "\n".(' 'x21):'');
+	    $line = '';
+	}
+    }
+
+    $primary_list .= $line;
+    $line= '';
+
+    while(defined(my $member = shift(@additional_members))) {
+	$line .= $member.(scalar(@additional_members) ? ', ':'');
+	if(40 - length($line) < 5) {
+	    $additional_list .= $line.(scalar(@additional_members) ? "\n".(' 'x21):'');
+	    $line = '';
+	}
+    }
+
+    $additional_list .= $line;
+
     printf("%-20s %s\n", 'Group Name:', defined($groupname) ? $groupname:'');
     printf("%-20s %s\n", 'Description:', defined($description) ? $description:'');
     printf("%-20s %s\n", 'GID:', defined($gid) ? $gid:'');
-    printf("%-20s %s\n", 'Primary members:', (scalar(@primary_members) > 0) ? join(', ', @primary_members):'');
-    printf("%-20s %s\n", 'Additional members:', (scalar(@additional_members) > 0) ? join(', ', @additional_members):'');
+    printf("%-20s %s\n", 'Primary members:', $primary_list);
+    printf("%-20s %s\n", 'Additional members:', $additional_list);
     printf("%-20s %s\n", 'Samba Domain:', defined($smbdomain) ? $smbdomain:'');
     printf("%-20s %s\n", 'Samba SID:', defined($sid) ? $sid:'');
 }

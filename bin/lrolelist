@@ -71,14 +71,60 @@ our $secret_file = "/etc/lusertools/ldap.secret";
 ########################################################################################
 
 our %config = (
-    'group_objectclasses'	=> [ 
+    'role_objectclasses'	=> [ 
 				    'top',
-				    'posixGroup',
-				    'sambaDomain'
+				    'radiusObjectProfile',
+				    'extensibleObject'
 				   ],
 
-    'group_naming_attr'		=> 'cn',
+    'user_naming_attr'		=> 'uid',
+    'role_naming_attr'		=> 'cn',
+    'uid_attr'			=> 'uidNumber',
+    'description_attr'		=> 'description',
+    'role_member_attr'		=> 'memberUid'
 );
+
+########################################################################################
+
+sub format_table($$$)
+{
+    my ($columns, $spacing, $offset) = @_;
+    my @table = ();
+
+    while(1) {
+	my @row = ();
+	my $i = 0;
+	foreach my $col (@{$columns}) {
+	    my $line = '';
+	    my $data = $col->{'data'};
+	    my $func = $col->{'func'};
+	    while(defined(my $chunk = shift(@{$data}))) {
+		if(defined($func) && ref($func) eq 'CODE') {
+		    $chunk = $func->($chunk);
+		}
+		$line .= $chunk.(scalar(@{$data}) ? $col->{'delim'}:'');
+		last if($col->{'width'} - length($line) < 5);
+	    }
+	    push @row, $line;
+	    $i++ if $line ne '';
+	}
+	last unless $i;
+	push @table, \@row;
+    }
+    
+    my $formatted = '';
+    
+    while(defined(my $row = shift(@table))) {
+	while(defined(my $col = shift @{$row})) {
+	    my $padding = $spacing - length($col);
+	    $padding = 1 if($padding < 1);
+	    $formatted .= $col.(scalar(@{$row}) ? (' 'x$padding):'');
+	}
+	$formatted .= scalar(@table) ? "\n".(' 'x$offset):'';
+    }
+
+    return $formatted;
+}
 
 ########################################################################################
 
@@ -126,19 +172,15 @@ sub ldap_unbind($)
 
 ########################################################################################
 
-sub is_group($$)
+sub get_uid($$)
 {
-    my ($ldap, $groupname) = @_;
+    my ($ldap, $username) = @_;
 
-    my $filter = sprintf('(&(%s=%s)%s)',
-			 $config{'group_naming_attr'},
-			 $groupname,
-			 $config{'group_objectclass_filter'});
-
-    my $res = $ldap->search('base'      => $config{'groups_dn'},
+    # Search for specific user by username
+    my $res = $ldap->search('base'      => $config{'users_dn'},
 			    'scope'     => 'one',
-			    'filter'    => $filter,
-			    'attrs'     => [ $config{'group_naming_attr'} ],
+			    'filter'    => sprintf('(%s=%s)', $config{'user_naming_attr'}, $username),
+			    'attrs'     => [ $config{'uid_attr'} ],
 			    'sizelimit' => 1);
 
     return undef unless defined($res);
@@ -151,29 +193,91 @@ sub is_group($$)
 	}
     }
 
-    return $res->count;
+    # Get user's LDAP object
+    my ($user) = $res->entries;
+    # Get UID
+    return $user->get_value($config{'uid_attr'});
 }
 
-sub delete_group($$)
+sub list_roles($)
 {
-    my ($ldap, $groupname) = @_;
+    my $ldap = shift;
 
-    # Group name must be defined
-    return 0 unless(defined($groupname) && $groupname ne '');
+    # This is a Server Side Sorting (SSS) control.
+    # We want to do a search with results sorted
+    # alphabetically, in ascending order
+    my $sort = Net::LDAP::Control::Sort->new('order' => $config{'role_naming_attr'});
 
-    # Format group object's DN
-    my $groupdn = sprintf('%s=%s,%s', $config{'group_naming_attr'}, $groupname, $config{'groups_dn'});
+    # Get the list of roles
+    my $res = $ldap->search('base'    => $config{'roles_dn'},
+			    'scope'   => 'one',
+			    'filter'  => $config{'role_objectclass_filter'},
+			    'control' => [ $sort ]);
 
-    # Delete group's LDAP object
-    my $res = $ldap->delete($groupdn);
+    return undef unless defined($res);
+
     if($res->code > 0) {
-	print STDERR $res->error."\n";
-	return 0;
+	# We can ignore 'size limit exceeded' error, but not others
+	if($res->code != LDAP_SIZELIMIT_EXCEEDED) {
+	    print STDERR $res->error."\n";
+	    return undef;
+	}
     }
 
-    print "Deleted group ".$groupname."\n";
+    # Print header
+    printf("%-16s %-39s %s\n%s\n",
+	   'Role Name',
+	   'Description',
+	   'Member',
+	   '-'x100);
 
-    return 1;
+    # Print roles' metadata
+    foreach my $role ($res->entries) {
+
+	my $rolename = $role->get_value($config{'role_naming_attr'});
+	my $description = $role->get_value($config{'description_attr'});
+	my @members = $role->get_value($config{'role_member_attr'});
+
+	# Put description and role members into columns
+	# of certain width, which will cause text to be 
+	# broken into multiple lines, if it's length
+	# exceeds column width
+	my $cols = [
+	    # Description
+	    {
+		'data' => [ split(/\s+/, defined($description) ? $description:'') ],
+		'width' => 30,
+		'delim' => ' '
+	    },
+	    # Role members
+	    {
+		'data' => \@members,
+		'width' => 30,
+		'delim' => ', ',
+		'func' => sub {
+		    my $username = shift;
+
+		    my $uid = get_uid($ldap, $username);
+		    if(defined($uid) && $uid ne '') {
+			$username .= ' ('.$uid.')';
+		    }
+
+		    return $username;
+		}
+	    }
+	];
+
+	# Put columns into a table with an offset
+	# of 17 characters from the beginning of
+	# each line and a max of 40 characters of
+	# spacing between columns
+	my $list = format_table($cols, 40, 17); 
+
+	printf("%-16s %-33s\n",
+	       defined($rolename) ? $rolename:'',
+	       $list);
+
+    }
 }
 
 ########################################################################################
@@ -228,8 +332,8 @@ sub get_config($$)
     close(CONF);
 
     # Make sure loaded configuration didn't mess up object classes
-    unless(defined($config{'group_objectclasses'}) && scalar(@{$config{'group_objectclasses'}}) > 0) {
-	print STDERR "At least one group object class must be defined.\n";
+    unless(defined($config{'role_objectclasses'}) && scalar(@{$config{'role_objectclasses'}}) > 0) {
+	print STDERR "At least one role object class must be defined.\n";
 	return 0;
     }
 
@@ -248,7 +352,7 @@ sub get_config($$)
 	# ... get LDAP bind secret
 	my $secret = <CONF>;
 	chomp $secret;
-	# ... close LDAP bind secret file
+	# ...  close LDAP bind secret file
 	close(CONF);
 	# ... use root DN as bind DN
 	$config{'bind_dn'} = $config{'root_dn'};
@@ -267,14 +371,14 @@ sub get_config($$)
 	return 0;
     }
 
-    unless(defined($config{'groups_dn'}) && $config{'groups_dn'} ne '') {
-	print STDERR "Groups base DN not configured properly.\n";
+    unless(defined($config{'roles_dn'}) && $config{'roles_dn'} ne '') {
+	print STDERR "Roles base DN not configured properly.\n";
 	return 0;
     }
 
     # Generate object class filter for search operations
-    $config{'group_objectclass_filter'} = '(&(objectClass='.join(')(objectClass=', @{$config{'group_objectclasses'}}).'))';
-    
+    $config{'role_objectclass_filter'} = '(&(objectClass='.join(')(objectClass=', @{$config{'role_objectclasses'}}).'))';
+
     return 1;
 }
 
@@ -283,15 +387,13 @@ sub get_config($$)
 sub usage()
 {
 print <<EOF 
-Usage: $COMMAND [OPTIONS] <groupname>
+Usage: $COMMAND [OPTIONS]
 
 OPTIONS:
 
  -C, --config <config file>
  -S, --secret <secret file>
 
- --confirmed
-   
  -h, --help
  -v, --version
 
@@ -311,52 +413,25 @@ sub version()
 #                                       M A I N
 ########################################################################################
 
-my ($groupname, $yes);
 my ($res, $help, $ver);
 
 # Get command line arguments, if any
-$res = GetOptions('help|h'	=> \$help,
-		  'version|v'	=> \$ver,
-		  'config|C=s'	=> \$config_file,
-		  'secret|S=s'	=> \$secret_file,
-		  'confirmed'	=> \$yes);
+$res = GetOptions('help|h'		=> \$help,
+		  'version|v'		=> \$ver,
+		  'config|C=s'		=> \$config_file,
+		  'secret|S=s'		=> \$secret_file);
 
 # Show help if requested
 usage() if(!$res || $help);
 # Show version, if requested
 version() if $ver;
 
-# Groupname is mandatory, obviously
-if(scalar(@ARGV) == 1) {
-    $groupname = shift @ARGV;
-# If command line arguments are wrong ...
-} else {
-    # ... show help
-    usage();
-}
-
-# Make sure we were invoked by root
-unless($> == 0 && $< == 0) {
-    print STDERR "Only root can use this command.\n";
-    exit(2);
-}
-
-# Checks and double-checks: groupname must be defined at this point
-unless(defined($groupname) && $groupname ne '') {
-    print STDERR "Group name is missing or invalid.\n";
-    exit(3);
-}
-
-# Deleting a group must be confirmed
-# to avoid accidental deletion ...
-unless($yes) {
-    print STDERR "Group deletion must be explicitly confirmed.\n";
-    exit(4);
-}
+# If command line arguments are wrong, show help
+usage() if(scalar(@ARGV) > 0);
 
 # Load config file
 get_config($config_file, $secret_file)
-  or exit(5);
+  or exit(4);
 
 $res = 0;
 
@@ -364,21 +439,13 @@ $res = 0;
 my $ldap = ldap_bind();
 unless(defined($ldap)) {
     print STDERR "Failed to connect to LDAP master.\n";
-    exit(6);
+    exit(5);
 }
 
-# Group must exist
-unless(is_group($ldap, $groupname)) {
-    print STDERR "Group ".$groupname." doesn't exist.\n";
-    exit(7);
-}
-
-# Delete group object from LDAP
-$res = delete_group($ldap, $groupname);
+# List role objects
+list_roles($ldap);
 
 # Unbind from server
 ldap_unbind($ldap);
-
-print "Group not deleted.\n" unless $res;
 
 exit($res ? 0:255);
