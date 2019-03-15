@@ -839,7 +839,7 @@ OPTIONS:
  -e, --email <email address>
  -c, --gecos <full name>
  -d, --homedir <home directory>
- -d, --shell <shell>
+ -s, --shell <shell>
 
  -u, --uid <uid>
  -g, --group <primary group>
