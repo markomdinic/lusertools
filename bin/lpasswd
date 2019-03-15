@@ -19,7 +19,7 @@
 #
 ###############################################################################
 
-our $VERSION = "2.1.0";
+our $VERSION = "2.1.1";
 
 ###############################################################################
 
@@ -553,7 +553,7 @@ if($interactive) {
 
 	# Password must be strong, unless we are root,
 	# in which case we can set whatever we want
-	if(is_strong($new_password) || ($> == 0 && $< == 0 && $current_username eq 'root')) {
+	if(($> == 0 && $< == 0 && $current_username eq 'root') || is_strong($new_password)) {
 
 	    # Ask for new password confirmation
 	    print "Retype ".$whose." new office password:";

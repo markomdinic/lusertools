@@ -19,7 +19,7 @@
 #
 ###############################################################################
 
-our $VERSION = "2.1.0";
+our $VERSION = "2.1.1";
 
 ###############################################################################
 
@@ -537,17 +537,19 @@ sub modify_user($$$$$$$$$;$$$$$)
     return 1;
 }
 
-sub reassign_user_to_groups($$@)
+sub reassign_user_to_groups($$$@)
 {
     my $ldap = shift;
     my $username = shift;
+    my $mode = shift;
 
     return 0 unless(scalar(@_) > 0 &&
 		    defined($config{'group_member_attr'}) &&
 		    $config{'group_member_attr'} ne '');
-    my %new_groups;
 
-    @new_groups{@_} = @_;
+    my %groups;
+
+    @groups{@_} = @_;
 
     my $filter = sprintf('(%s=%s)', $config{'group_member_attr'}, $username);
 
@@ -571,12 +573,31 @@ sub reassign_user_to_groups($$@)
 	my $groupname = $group->get_value($config{'group_naming_attr'});
 	next unless(defined($groupname) && $groupname ne '');
 
-	# If user already belongs to one of the new additional groups ...
-	if(defined($new_groups{$groupname})) {
-	    # ... remove that group from the list of new groups ...
-	    delete $new_groups{$groupname};
-	    # ... obviously, do not remove user from this group
+	# If mode is additive ...
+	if($mode eq '+') {
+
+	    # ... remove existing group from the list of new groups ...
+	    delete $groups{$groupname};
+	    # ... and do not remove anything, ever
 	    next;
+
+	# If mode is subtractive ...
+	} elsif($mode eq '-') {
+
+	    # ... skip existing group if it is not on the removal list
+	    next unless defined($groups{$groupname});
+
+	# Otherwise, replace groups
+	} else {
+
+	    # If user already belongs to one of the new additional groups ...
+	    if(defined($groups{$groupname})) {
+		# ... remove that group from the list of new groups ...
+		delete $groups{$groupname};
+		# ... obviously, do not remove user from this group
+		next;
+	    }
+
 	}
 
 	# Get group object's DN
@@ -595,8 +616,10 @@ sub reassign_user_to_groups($$@)
 
     }
 
+    return 1 if $mode eq '-';
+
     # Add user to every new group in the list
-    foreach my $group (keys %new_groups) {
+    foreach my $group (keys %groups) {
 
 	next if $group eq '';
 
@@ -617,18 +640,19 @@ sub reassign_user_to_groups($$@)
     return 1;
 }
 
-sub reassign_user_roles($$@)
+sub reassign_user_roles($$$@)
 {
     my $ldap = shift;
     my $username = shift;
+    my $mode = shift;
 
     return 0 unless(scalar(@_) > 0 &&
 		    defined($config{'role_member_attr'}) &&
 		    $config{'role_member_attr'} ne '');
 
-    my %new_roles;
+    my %roles;
 
-    @new_roles{@_} = @_;
+    @roles{@_} = @_;
 
     my $filter = sprintf('(%s=%s)', $config{'role_member_attr'}, $username);
 
@@ -652,12 +676,31 @@ sub reassign_user_roles($$@)
 	my $rolename = $role->get_value($config{'role_naming_attr'});
 	next unless(defined($rolename) && $rolename ne '');
 
-	# If user is already assigned one of new roles ...
-	if(defined($new_roles{$rolename})) {
-	    # ... remove that role from the list of new roles ...
-	    delete $new_roles{$rolename};
-	    # ... obviously, do not unassign this role from user
+	# If mode is additive ...
+	if($mode eq '+') {
+
+	    # ... take the existing role of the list of new roles ...
+	    delete $roles{$rolename};
+	    # ... and do not remove anything, ever
 	    next;
+
+	# If mode is subtractive ...
+	} elsif($mode eq '-') {
+
+	    # ... skip existing role if it is not on the removal list
+	    next unless defined($roles{$rolename});
+
+	# Otherwise, replace roles
+	} else {
+
+	    # If user is already assigned one of new roles ...
+	    if(defined($roles{$rolename})) {
+		# ... remove that role from the list of new roles ...
+		delete $roles{$rolename};
+		# ... obviously, do not unassign this role from user
+		next;
+	    }
+
 	}
 
 	# Get role object's DN
@@ -676,8 +719,10 @@ sub reassign_user_roles($$@)
 
     }
 
+    return 1 if $mode eq '-';
+
     # Assign every new role in the list to user
-    foreach my $role (keys %new_roles) {
+    foreach my $role (keys %roles) {
 
 	next if $role eq '';
 
@@ -843,8 +888,8 @@ OPTIONS:
 
  -u, --uid <uid>
  -g, --group <primary group>
- -G, --groups <additional group 1>[,<additional group 2>,...]
- -R, --roles  <custom role 1>[,<custom role 2>,...]
+ -G, --groups [+-]<additional group 1>[,<additional group 2>,...] | ''
+ -R, --roles [+-]<custom role 1>[,<custom role 2>,...] | ''
 
  -i, --sid <SID>
 
@@ -875,6 +920,7 @@ sub version()
 
 my ($username, $email, $full_name, $uid, $sid, $group, $homedir, $shell);
 my (@additional_groups, @roles);
+my ($groups_mode, $roles_mode);
 my ($mailhost, $mailbox, $mailquota);
 my $newname;
 my ($res, $help, $ver);
@@ -925,16 +971,31 @@ unless(defined($username) && $username ne '') {
     exit(3);
 }
 
+$groups_mode = '=';
+
 # Option -G can be given multiple times,
 # each time with multiple comma-separated
 # groups. This way we normalize it into
 # a simple array of group names
 unless(scalar(@additional_groups) == 1 && $additional_groups[0] eq '') {
     @additional_groups = split(/,/, join(',', @additional_groups));
+    if(defined($additional_groups[0]) &&
+       $additional_groups[0] =~ /^([\+\-\=])(.+)$/) {
+	$groups_mode = $1;
+	$additional_groups[0] = $2;
+    }
 }
+
+$roles_mode = '=';
+
 # Option -R follows the same logic
 unless(scalar(@roles) == 1 && $roles[0] eq '') {
     @roles = split(/,/, join(',', @roles));
+    if(defined($roles[0]) &&
+       $roles[0] =~ /^([\+\-\=])(.+)$/) {
+	$roles_mode = $1;
+	$roles[0] = $2;
+    }
 }
 
 # Load config file
@@ -1016,9 +1077,9 @@ $res = modify_user($ldap,
 if($res) {
     # ... and additional groups were given,
     # reassign user to specified groups
-    reassign_user_to_groups($ldap, $username, @additional_groups);
+    reassign_user_to_groups($ldap, $username, $groups_mode, @additional_groups);
     # ... if roles were given reassign them
-    reassign_user_roles($ldap, $username, @roles);
+    reassign_user_roles($ldap, $username, $roles_mode, @roles);
 }
 
 # Unbind from server
