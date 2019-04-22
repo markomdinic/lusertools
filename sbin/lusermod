@@ -19,7 +19,7 @@
 #
 ###############################################################################
 
-our $VERSION = "2.1.1";
+our $VERSION = "2.1.2";
 
 ###############################################################################
 
@@ -357,9 +357,43 @@ sub check_roles($@)
     return 1;
 }
 
-sub modify_user($$$$$$$$$;$$$$$)
+sub get_roles($$)
 {
-    my ($ldap, $username, $email, $full_name, $uid, $sid, $group, $homedir, $shell, $roles, $mailhost, $mailbox, $mailquota, $newname) = @_;
+    my ($ldap, $username) = @_;
+
+    # Search for roles assigned to this user
+    my $res = $ldap->search('base'   => $config{'roles_dn'},
+			    'scope'  => 'one',
+			    'filter' => sprintf('(%s=%s)', $config{'role_member_attr'}, $username),
+			    'attrs'  => [ $config{'role_naming_attr'}]);
+
+    return () unless defined($res);
+
+    if($res->code > 0) {
+	# We can ignore 'size limit exceeded' error, but not others
+	if($res->code != LDAP_SIZELIMIT_EXCEEDED) {
+	    print STDERR $res->error."\n";
+	    return ();
+	}
+    }
+
+    my @roles = ();
+
+    # Collect results
+    foreach my $role ($res->entries) {
+	# Get the role's name
+	my $rolename = $role->get_value($config{'role_naming_attr'});
+	next unless(defined($rolename) && $rolename ne '');
+	# Add rolename to the list
+	push @roles, $rolename;
+    }
+
+    return @roles;
+}
+
+sub modify_user($$$$$$$$$;$$$$$$)
+{
+    my ($ldap, $username, $email, $full_name, $uid, $sid, $group, $homedir, $shell, $roles, $rmode, $mailhost, $mailbox, $mailquota, $newname) = @_;
 
     # Username must be defined
     return 0 unless(defined($username) && $username ne '');
@@ -458,7 +492,35 @@ sub modify_user($$$$$$$$$;$$$$$)
     if(defined($roles) && scalar(@{$roles}) > 0) {
 	# ... and custom roles attribute is defined ...
 	if(defined($config{'roles_attr'}) && $config{'roles_attr'} ne '') {
-	    # ... add roles to user object's attributes
+	    # If we are NOT replacing entire set of roles ...
+	    if($rmode ne '=') { 
+		# ... get current role set
+		my @curroles = get_roles($ldap, $username);
+		# ... put roles into a hash ...
+		my %newroles;
+		# ... for easier manipulation
+		@newroles{@curroles} = @curroles;
+		# If we are adding new roles ...
+		if($rmode eq '+') { 
+		    # ... compose new role set ...
+		    foreach my $role (@{$roles}) {
+			# ... by adding new roles to the set,
+			# ignoring roles that already exist
+			# (hash enforces uniqueness)
+			$newroles{$role} = $role;
+		    }
+		# If we are removing roles ...
+		} elsif($rmode eq '-') { 
+		    # ... compose new role set ...
+		    foreach my $role (@{$roles}) {
+			# ... by removing given roles from the set
+			delete $newroles{$role};
+		    }
+		}
+		# Extract resulting role set from hash ...
+		$roles = [ keys %newroles ];
+	    }
+	    # ... add role set to user object's attributes
 	    $attrs{$config{'roles_attr'}} = $roles;
 	}
     }
@@ -1068,6 +1130,7 @@ $res = modify_user($ldap,
 		   $homedir,
 		   $shell,
 		   \@roles,
+		   $roles_mode,
 		   $mailhost,
 		   $mailbox,
 		   $mailquota,
