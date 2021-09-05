@@ -2,7 +2,7 @@
 #
 # lusertools (Tools for managing user accounts and groups stored in LDAP)
 #
-# Copyright (c) 2019 Marko Dinic. All rights reserved.
+# Copyright (c) 2021 Marko Dinic. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -19,7 +19,7 @@
 #
 ###############################################################################
 
-our $VERSION = "2.1.2";
+our $VERSION = "2.1.3";
 
 ###############################################################################
 
@@ -132,6 +132,38 @@ sub ldap_unbind($)
 
 ###############################################################################
 
+sub get_group($$)
+{
+    my ($ldap, $groupname) = @_;
+
+    my $filter = sprintf('(&(%s=%s)%s)',
+			 $config{'group_naming_attr'},
+			 $groupname,
+			 $config{'group_objectclass_filter'});
+
+    my $res = $ldap->search('base'      => $config{'groups_dn'},
+			    'scope'     => 'one',
+			    'filter'    => $filter,
+			    'sizelimit' => 1);
+
+    return undef unless defined($res);
+
+    if($res->code > 0) {
+	# We can ignore 'size limit exceeded' error, but not others
+	if($res->code != LDAP_SIZELIMIT_EXCEEDED) {
+	    print STDERR $res->error."\n";
+	    return undef;
+	}
+    }
+
+    return undef unless($res->count > 0);
+
+    # Get retrieved result
+    my ($entry) = $res->entries;
+
+    return $entry;
+}
+
 sub is_group($$)
 {
     my ($ldap, $groupname) = @_;
@@ -200,12 +232,29 @@ sub modify_group($$$$$$)
 
     my %attrs = ();
 
+    # Retrieve group object
+    my $group = get_group($ldap, $groupname);
+
     # If GID is defined ...
     if(defined($gid) && $gid =~ /^\d+$/) {
 	# ... and GID attribute is defined ...
 	if(defined($config{'gid_attr'}) && $config{'gid_attr'} ne '') {
 	    # ... add GID to group object's attributes
 	    $attrs{$config{'gid_attr'}} = $gid;
+	}
+	# If SID was not given ...
+	unless(defined($sid) && $sid =~ /^S\-\d+\-\d+\-\d+/) {
+	    # ... and samba SID attribute is defined ...
+	    if(defined($config{'samba_sid_attr'}) && $config{'samba_sid_attr'} ne '') {
+		my $current_gid = $group->get_value($config{'gid_attr'});
+		my $current_sid = $group->get_value($config{'samba_sid_attr'});
+		# ... and the last segment of the SID contains current GID ...
+		if(defined($current_sid) && $current_sid =~ /^S(?:\-\d+)+\-$current_gid$/) {
+		    # ... replace the segment with the new GID
+		    $sid = $current_sid;
+		    $sid =~ s/$current_gid$/$gid/;
+		}
+	    }
 	}
     }
 

@@ -2,7 +2,7 @@
 #
 # lusertools (Tools for managing user accounts and groups stored in LDAP)
 #
-# Copyright (c) 2019 Marko Dinic. All rights reserved.
+# Copyright (c) 2021 Marko Dinic. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -19,7 +19,7 @@
 #
 ###############################################################################
 
-our $VERSION = "2.1.2";
+our $VERSION = "2.1.3";
 
 ###############################################################################
 
@@ -186,6 +186,38 @@ sub ldap_unbind($)
 }
 
 ###############################################################################
+
+sub get_user($$)
+{
+    my ($ldap, $username) = @_;
+
+    my $filter = sprintf('(&(%s=%s)%s)',
+			 $config{'user_naming_attr'},
+			 $username,
+			 $config{'user_objectclass_filter'});
+
+    my $res = $ldap->search('base'      => $config{'users_dn'},
+			    'scope'     => 'one',
+			    'filter'    => $filter,
+			    'sizelimit' => 1);
+
+    return undef unless defined($res);
+
+    if($res->code > 0) {
+	# We can ignore 'size limit exceeded' error, but not others
+	if($res->code != LDAP_SIZELIMIT_EXCEEDED) {
+	    print STDERR $res->error."\n";
+	    return undef;
+	}
+    }
+
+    return undef unless($res->count > 0);
+
+    # Get retrieved result
+    my ($entry) = $res->entries;
+
+    return $entry;
+}
 
 sub is_user($$)
 {
@@ -402,6 +434,10 @@ sub modify_user($$$$$$$$$;$$$$$$)
     my $userdn = sprintf('%s=%s,%s', $config{'user_naming_attr'}, $username, $config{'users_dn'});
 
     my %attrs = ();
+    my $mod_sid;
+
+    # Retrieve user object
+    my $user = get_user($ldap, $username);
 
     # If UID was given ...
     if(defined($uid) && $uid =~ /^\d+$/) {
@@ -414,6 +450,20 @@ sub modify_user($$$$$$$$$;$$$$$$)
 	if(defined($config{'rid_attr'}) && $config{'rid_attr'} ne '') {
 	    # ... use UID as RID and add it to user object's attributes
 	    $attrs{$config{'rid_attr'}} = $uid;
+	}
+	# If SID was not given ...
+	unless(defined($sid) && $sid =~ /^S\-\d+\-\d+\-\d+/) {
+	    # ... and samba SID attribute is defined ...
+	    if(defined($config{'samba_sid_attr'}) && $config{'samba_sid_attr'} ne '') {
+		my $current_uid = $user->get_value($config{'uid_attr'});
+		my $current_sid = $user->get_value($config{'samba_sid_attr'});
+		# ... and the last segment of the SID contains current UID ...
+		if(defined($current_sid) && $current_sid =~ /^S(?:\-\d+)+\-$current_uid$/) {
+		    # ... replace the segment with the new UID
+		    $mod_sid = $current_sid;
+		    $mod_sid =~ s/$current_uid$/$uid/;
+		}
+	    }
 	}
     }
 
@@ -435,8 +485,24 @@ sub modify_user($$$$$$$$$;$$$$$$)
 	    }
 	    # Add GID to user object's attributes
 	    $attrs{$config{'gid_attr'}} = $gid;
+	    # If SID was not given ...
+	    unless(defined($sid) && $sid =~ /^S\-\d+\-\d+\-\d+/) {
+		# ... and samba SID attribute is defined ...
+		if(defined($config{'samba_sid_attr'}) && $config{'samba_sid_attr'} ne '') {
+		    my $current_gid = $user->get_value($config{'gid_attr'});
+		    my $current_sid = defined($mod_sid) ? $mod_sid:$user->get_value($config{'samba_sid_attr'});
+		    # ... and the second to last segment of the SID contains current GID ...
+		    if(defined($current_sid) && $current_sid =~ /^S(?:\-\d+)+\-$current_gid\-\d+$/) {
+			# ... replace the segment with the new GID
+			$mod_sid = $current_sid;
+			$mod_sid =~ s/$current_gid(\-\d+)$/$gid$1/;
+		    }
+		}
+	    }
 	}
     }
+
+    $sid = $mod_sid unless defined($sid);
 
     # If SID was given ...
     if(defined($sid) && $sid =~ /^S\-\d+\-\d+\-\d+/) {

@@ -2,7 +2,7 @@
 #
 # lusertools (Tools for managing user accounts and groups stored in LDAP)
 #
-# Copyright (c) 2019 Marko Dinic. All rights reserved.
+# Copyright (c) 2021 Marko Dinic. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -19,7 +19,7 @@
 #
 ###############################################################################
     
-our $VERSION = "2.1.2";
+our $VERSION = "2.1.3";
 
 ###############################################################################
 
@@ -546,7 +546,7 @@ sub create_user($$$$$$$$$;$$$$)
 		return 0;
 	    }
 	    # Format user SID and add it to user object's attributes
-	    $attrs{$config{'samba_sid_attr'}} = sprintf('%s-%d-%d-%d', $sid, time(), int(rand(123456789)), $uid);
+	    $attrs{$config{'samba_sid_attr'}} = sprintf('%s-%d', $sid, $uid);
 	}
     }
 
