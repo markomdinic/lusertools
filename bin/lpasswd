@@ -19,7 +19,7 @@
 #
 ###############################################################################
 
-our $VERSION = "2.1.3";
+our $VERSION = "2.1.4";
 
 ###############################################################################
 
@@ -97,7 +97,8 @@ sub unix_password($)
 	read(U, my $rnd, 256);
 	close(U);
 	# Format salt for SHA256 encryption scheme
-	$salt = '$5$'.encode_base64($rnd);
+	# and DO NOT break it into multiple lines
+	$salt = '$5$'.encode_base64($rnd, '');
     }
     # Encrypt password with generated salt
     my $hash = crypt($password, $salt);

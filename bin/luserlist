@@ -19,7 +19,7 @@
 #
 ###############################################################################
 
-our $VERSION = "2.1.3";
+our $VERSION = "2.1.4";
 
 ###############################################################################
 
@@ -122,9 +122,9 @@ sub format_table($$$)
 	last unless $i;
 	push @table, \@row;
     }
-    
+
     my $formatted = '';
-    
+
     while(defined(my $row = shift(@table))) {
 	while(defined(my $col = shift @{$row})) {
 	    my $padding = $spacing - length($col);
